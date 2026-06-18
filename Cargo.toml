@@ -54,6 +54,9 @@ pin-project-lite = "0.2"
 sha2 = "0.11.0"
 ed25519-dalek = "2.2.0"
 hex = "0.4.3"
+duckdb = { version = "1.10504.0", features = ["bundled"] }
+ignore = "0.4.26"
+notify = "8.2.0"
 
 [features]
 default = ["tls"]

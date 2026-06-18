@@ -2,6 +2,7 @@
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
+use crate::indexer::Indexer;
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
 use crate::Args;
@@ -60,6 +61,7 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
+const QUERY_PATH: &str = "__dufs__/query";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 pub struct Server {
@@ -68,6 +70,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    indexer: Option<Indexer>,
 }
 
 impl Server {
@@ -90,12 +93,30 @@ impl Server {
             Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
             None => Cow::Borrowed(INDEX_HTML),
         };
+        let indexer = if args.enable_index {
+            let db_path = args
+                .index_db
+                .clone()
+                .unwrap_or_else(|| Indexer::default_db_path(&args.serve_path));
+            Some(Indexer::new(
+                args.serve_path.clone(),
+                db_path,
+                args.hidden.clone(),
+                args.allow_symlink,
+                args.index_watch,
+                args.index_scan_interval,
+                running.clone(),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             args,
             running,
             single_file_req_paths,
             assets_prefix,
             html,
+            indexer,
         })
     }
 
@@ -227,6 +248,11 @@ impl Server {
 
         if has_query_flag(&query_params, "tokengen") {
             self.handle_tokengen(&relative_path, user, &mut res).await?;
+            return Ok(res);
+        }
+
+        if relative_path == QUERY_PATH {
+            self.handle_query(req, access_paths, &mut res).await?;
             return Ok(res);
         }
 
@@ -551,6 +577,9 @@ impl Server {
         }
 
         *res.status_mut() = status;
+        if let Some(indexer) = &self.indexer {
+            indexer.upsert_path(path);
+        }
 
         Ok(())
     }
@@ -562,6 +591,9 @@ impl Server {
         }
 
         status_no_content(res);
+        if let Some(indexer) = &self.indexer {
+            indexer.remove_path(path);
+        }
         Ok(())
     }
 
@@ -618,24 +650,31 @@ impl Server {
         }
 
         if !head_only {
-            let path_buf = path.to_path_buf();
-            let hidden = Arc::new(self.args.hidden.to_vec());
-            let search = search.clone();
+            if let Some(indexer) = &self.indexer {
+                paths = indexer
+                    .search(path, search.clone(), MAX_SUBPATHS_COUNT)
+                    .await?;
+            } else {
+                let path_buf = path.to_path_buf();
+                let hidden = Arc::new(self.args.hidden.to_vec());
+                let search = search.clone();
 
-            let search_paths = tokio::spawn(collect_dir_entries(
-                access_paths.clone(),
-                self.running.clone(),
-                path_buf,
-                hidden,
-                self.args.allow_symlink,
-                self.args.serve_path.clone(),
-                move |x| get_file_name(x.path()).to_lowercase().contains(&search),
-            ))
-            .await?;
+                let search_paths = tokio::spawn(collect_dir_entries(
+                    access_paths.clone(),
+                    self.running.clone(),
+                    path_buf,
+                    hidden,
+                    self.args.allow_symlink,
+                    self.args.serve_path.clone(),
+                    move |x| get_file_name(x.path()).to_lowercase().contains(&search),
+                ))
+                .await?;
 
-            for search_path in search_paths.into_iter() {
-                if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
-                    paths.push(item);
+                for search_path in search_paths.into_iter() {
+                    if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await
+                    {
+                        paths.push(item);
+                    }
                 }
             }
         }
@@ -696,6 +735,57 @@ impl Server {
         );
         let boxed_body = stream_body.boxed();
         *res.body_mut() = boxed_body;
+        Ok(())
+    }
+
+    async fn handle_query(
+        &self,
+        req: Request,
+        access_paths: AccessPaths,
+        res: &mut Response,
+    ) -> Result<()> {
+        if !self.args.allow_query {
+            status_forbid(res);
+            return Ok(());
+        }
+        let Some(indexer) = &self.indexer else {
+            status_not_found(res);
+            return Ok(());
+        };
+        if req.method() != Method::POST {
+            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            return Ok(());
+        }
+        let body = req.collect().await?.to_bytes();
+        let mut sql = String::from_utf8(body.to_vec()).map_err(|_| anyhow!("Invalid UTF-8 SQL"))?;
+        if sql.trim_start().starts_with('{') {
+            let value: serde_json::Value = serde_json::from_str(&sql)?;
+            sql = value
+                .get("sql")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("Missing sql"))?
+                .to_string();
+        }
+        let path_filters = access_paths
+            .entry_paths(&self.args.serve_path)
+            .into_iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.args.serve_path)
+                    .ok()
+                    .map(normalize_path)
+            })
+            .collect::<Vec<_>>();
+        match indexer.query(sql, MAX_SUBPATHS_COUNT, path_filters).await {
+            Ok(output) => {
+                let output = serde_json::to_string_pretty(&output)?;
+                res.headers_mut()
+                    .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                res.headers_mut()
+                    .typed_insert(ContentLength(output.len() as u64));
+                *res.body_mut() = body_full(output);
+            }
+            Err(err) => status_bad_request(res, &err.to_string()),
+        }
         Ok(())
     }
 
@@ -1146,6 +1236,9 @@ impl Server {
     async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
         fs::create_dir_all(path).await?;
         *res.status_mut() = StatusCode::CREATED;
+        if let Some(indexer) = &self.indexer {
+            indexer.upsert_path(path);
+        }
         Ok(())
     }
 
@@ -1173,6 +1266,9 @@ impl Server {
         fs::copy(path, &dest).await?;
 
         status_no_content(res);
+        if let Some(indexer) = &self.indexer {
+            indexer.scan_path(&dest);
+        }
         Ok(())
     }
 
@@ -1194,6 +1290,9 @@ impl Server {
         fs::rename(path, &dest).await?;
 
         status_no_content(res);
+        if let Some(indexer) = &self.indexer {
+            indexer.move_path(path, &dest);
+        }
         Ok(())
     }
 
@@ -1854,6 +1953,10 @@ fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
         }
         glob(v, file_name)
     })
+}
+
+pub(crate) fn is_hidden_path(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
+    is_hidden(hidden, file_name, is_dir)
 }
 
 fn set_webdav_headers(res: &mut Response) {

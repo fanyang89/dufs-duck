@@ -157,6 +157,57 @@ pub fn build_cli() -> Command {
                 .help("Allow ?hash query to get file sha256 hash"),
         )
         .arg(
+            Arg::new("allow-query")
+                .env("DUFS_ALLOW_QUERY")
+                .hide_env(true)
+                .long("allow-query")
+                .action(ArgAction::SetTrue)
+                .help("Allow SQL SELECT queries against the file index"),
+        )
+        .arg(
+            Arg::new("enable-index")
+                .env("DUFS_ENABLE_INDEX")
+                .hide_env(true)
+                .long("enable-index")
+                .action(ArgAction::SetTrue)
+                .help("Enable DuckDB file indexing"),
+        )
+        .arg(
+            Arg::new("index-db")
+                .env("DUFS_INDEX_DB")
+                .hide_env(true)
+                .long("index-db")
+                .value_parser(value_parser!(PathBuf))
+                .help("Path to the DuckDB index database")
+                .value_name("file"),
+        )
+        .arg(
+            Arg::new("index-watch")
+                .env("DUFS_INDEX_WATCH")
+                .hide_env(true)
+                .long("index-watch")
+                .action(ArgAction::SetTrue)
+                .help("Watch the file system and update the index"),
+        )
+        .arg(
+            Arg::new("no-index-watch")
+                .env("DUFS_NO_INDEX_WATCH")
+                .hide_env(true)
+                .long("no-index-watch")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("index-watch")
+                .help("Disable file system watching for the index"),
+        )
+        .arg(
+            Arg::new("index-scan-interval")
+                .env("DUFS_INDEX_SCAN_INTERVAL")
+                .hide_env(true)
+                .long("index-scan-interval")
+                .value_parser(value_parser!(u64))
+                .help("Periodic index scan interval in seconds, 0 disables it")
+                .value_name("seconds"),
+        )
+        .arg(
             Arg::new("enable-cors")
                 .env("DUFS_ENABLE_CORS")
 				.hide_env(true)
@@ -290,6 +341,15 @@ pub struct Args {
     pub allow_symlink: bool,
     pub allow_archive: bool,
     pub allow_hash: bool,
+    pub allow_query: bool,
+    pub enable_index: bool,
+    pub index_db: Option<PathBuf>,
+    #[serde(default = "default_index_watch")]
+    #[default(default_index_watch())]
+    pub index_watch: bool,
+    #[serde(default = "default_index_scan_interval")]
+    #[default(default_index_scan_interval())]
+    pub index_scan_interval: u64,
     pub render_index: bool,
     pub render_spa: bool,
     pub render_try_index: bool,
@@ -387,6 +447,23 @@ impl Args {
         }
         if !args.allow_hash {
             args.allow_hash = allow_all || matches.get_flag("allow-hash");
+        }
+        if !args.allow_query {
+            args.allow_query = allow_all || matches.get_flag("allow-query");
+        }
+        if !args.enable_index {
+            args.enable_index = matches.get_flag("enable-index");
+        }
+        if let Some(index_db) = matches.get_one::<PathBuf>("index-db") {
+            args.index_db = Some(index_db.clone());
+        }
+        if matches.get_flag("no-index-watch") {
+            args.index_watch = false;
+        } else if matches.get_flag("index-watch") {
+            args.index_watch = true;
+        }
+        if let Some(interval) = matches.get_one::<u64>("index-scan-interval") {
+            args.index_scan_interval = *interval;
         }
         if !args.allow_archive {
             args.allow_archive = allow_all || matches.get_flag("allow-archive");
@@ -643,6 +720,14 @@ fn default_addrs() -> Vec<BindAddr> {
 
 fn default_port() -> u16 {
     5000
+}
+
+fn default_index_watch() -> bool {
+    true
+}
+
+fn default_index_scan_interval() -> u64 {
+    300
 }
 
 #[cfg(test)]

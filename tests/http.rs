@@ -4,6 +4,8 @@ mod utils;
 use fixtures::{server, Error, TestServer, BIN_FILE};
 use rstest::rstest;
 use serde_json::Value;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use utils::retrieve_edit_file;
 
 #[rstest]
@@ -117,6 +119,66 @@ fn get_dir_search(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     for p in paths {
         assert!(p.contains("test.html"));
     }
+    Ok(())
+}
+
+#[rstest]
+fn get_dir_indexed_search(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "test.html")),
+        "test.html",
+    )?;
+    assert!(text.split('\n').any(|v| v == "test.html"));
+    Ok(())
+}
+
+#[rstest]
+fn indexed_search_updates_after_write(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}indexed-new.txt", server.url());
+    let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 201);
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "indexed-new.txt")),
+        "indexed-new.txt",
+    )?;
+    assert!(text.split('\n').any(|v| v == "indexed-new.txt"));
+
+    let resp = fetch!(b"DELETE", &url).send()?;
+    assert_eq!(resp.status(), 204);
+    let text = wait_text_not_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "indexed-new.txt")),
+        "indexed-new.txt",
+    )?;
+    assert!(!text.contains("indexed-new.txt"));
+    Ok(())
+}
+
+#[rstest]
+fn indexed_sql_query(
+    #[with(&[
+        "-A",
+        "--enable-index",
+        "--allow-query",
+        "--index-scan-interval",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}__dufs__/query", server.url());
+    let text = wait_text_contains(
+        || {
+            reqwest::blocking::Client::new()
+                .post(&url)
+                .body("SELECT path FROM files WHERE path = 'test.html'")
+                .send()
+        },
+        "test.html",
+    )?;
+    assert!(text.contains("path"));
     Ok(())
 }
 
@@ -406,4 +468,36 @@ fn resumable_upload(#[with(&["--allow-upload"])] server: TestServer) -> Result<(
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().unwrap(), "abc123");
     Ok(())
+}
+
+fn wait_text_contains<F>(mut fetch: F, needle: &str) -> Result<String, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        assert_eq!(resp.status(), 200);
+        let text = resp.text()?;
+        if text.contains(needle) || start.elapsed() > Duration::from_secs(5) {
+            return Ok(text);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_text_not_contains<F>(mut fetch: F, needle: &str) -> Result<String, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        assert_eq!(resp.status(), 200);
+        let text = resp.text()?;
+        if !text.contains(needle) || start.elapsed() > Duration::from_secs(5) {
+            return Ok(text);
+        }
+        sleep(Duration::from_millis(100));
+    }
 }

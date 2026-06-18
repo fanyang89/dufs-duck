@@ -2,6 +2,7 @@ mod args;
 mod auth;
 mod http_logger;
 mod http_utils;
+mod indexer;
 mod logger;
 mod noscript;
 mod server;
@@ -34,7 +35,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::{net::TcpListener, task::JoinHandle};
 #[cfg(feature = "tls")]
-use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tokio_rustls::{
+    rustls::{crypto::aws_lc_rs, ServerConfig},
+    TlsAcceptor,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,9 +92,12 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                     (Some(cert_file), Some(key_file)) => {
                         let certs = load_certs(cert_file)?;
                         let key = load_private_key(key_file)?;
-                        let mut config = ServerConfig::builder()
-                            .with_no_client_auth()
-                            .with_single_cert(certs, key)?;
+                        let mut config = ServerConfig::builder_with_provider(
+                            aws_lc_rs::default_provider().into(),
+                        )
+                        .with_safe_default_protocol_versions()?
+                        .with_no_client_auth()
+                        .with_single_cert(certs, key)?;
                         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                         let config = Arc::new(config);
                         let tls_accepter = TlsAcceptor::from(config);
@@ -101,20 +108,20 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                                 let Ok((stream, addr)) = listener.accept().await else {
                                     continue;
                                 };
-                                let Some(stream) =
-                                    timeout(handshake_timeout, tls_accepter.accept(stream))
-                                        .await
-                                        .ok()
-                                        .and_then(|v| v.ok())
-                                else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
+                                let tls_accepter = tls_accepter.clone();
+                                let server_handle = server_handle.clone();
+                                tokio::spawn(async move {
+                                    let Some(stream) =
+                                        timeout(handshake_timeout, tls_accepter.accept(stream))
+                                            .await
+                                            .ok()
+                                            .and_then(|v| v.ok())
+                                    else {
+                                        return;
+                                    };
+                                    let stream = TokioIo::new(stream);
+                                    handle_stream(server_handle, stream, Some(addr)).await;
+                                });
                             }
                         });
 
