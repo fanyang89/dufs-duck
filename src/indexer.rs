@@ -8,11 +8,56 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot;
+
+const INDEX_SCAN_BATCH_SIZE: usize = 128;
+const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
+const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
+
+#[derive(Debug, Default)]
+pub struct ServerLoad {
+    active_requests: AtomicUsize,
+    active_file_streams: Arc<AtomicUsize>,
+    latency_ewma_ms: AtomicU64,
+}
+
+impl ServerLoad {
+    pub fn active_file_streams(&self) -> Arc<AtomicUsize> {
+        self.active_file_streams.clone()
+    }
+
+    pub fn begin_request(&self) {
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end_request(&self, elapsed: Duration) {
+        self.active_requests.fetch_sub(1, Ordering::SeqCst);
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        let current = self.latency_ewma_ms.load(Ordering::SeqCst);
+        let next = if current == 0 {
+            elapsed_ms
+        } else {
+            (current * 7 + elapsed_ms) / 8
+        };
+        self.latency_ewma_ms.store(next, Ordering::SeqCst);
+    }
+
+    fn active_requests(&self) -> usize {
+        self.active_requests.load(Ordering::SeqCst)
+    }
+
+    fn active_file_stream_count(&self) -> usize {
+        self.active_file_streams.load(Ordering::SeqCst)
+    }
+
+    fn latency_ewma_ms(&self) -> u64 {
+        self.latency_ewma_ms.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Clone)]
 pub struct Indexer {
@@ -57,6 +102,7 @@ impl Indexer {
         watch: bool,
         scan_interval: u64,
         running: Arc<AtomicBool>,
+        load: Arc<ServerLoad>,
     ) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -72,6 +118,7 @@ impl Indexer {
                 db_path,
                 hidden,
                 follow_symlinks,
+                load,
                 worker_running,
             ) {
                 error!("indexer stopped: {err}");
@@ -205,9 +252,10 @@ fn run_worker(
     db_path: PathBuf,
     hidden: Vec<String>,
     follow_symlinks: bool,
+    load: Arc<ServerLoad>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut db = IndexDb::new(serve_path, db_path, hidden, follow_symlinks)?;
+    let mut db = IndexDb::new(serve_path, db_path, hidden, follow_symlinks, load)?;
     while running.load(Ordering::SeqCst) {
         let Ok(cmd) = rx.recv_timeout(Duration::from_secs(1)) else {
             continue;
@@ -268,6 +316,55 @@ struct IndexDb {
     serve_path: PathBuf,
     hidden: Vec<String>,
     follow_symlinks: bool,
+    generation: u64,
+    throttle: IndexThrottle,
+}
+
+struct IndexThrottle {
+    load: Arc<ServerLoad>,
+    batch_size: usize,
+    processed: usize,
+}
+
+impl IndexThrottle {
+    fn new(load: Arc<ServerLoad>) -> Self {
+        Self {
+            load,
+            batch_size: INDEX_SCAN_BATCH_SIZE,
+            processed: 0,
+        }
+    }
+
+    fn step(&mut self) {
+        self.processed += 1;
+        if self.processed < self.batch_size {
+            return;
+        }
+        self.processed = 0;
+        let delay = self.delay();
+        if delay > Duration::ZERO {
+            thread::sleep(delay);
+        } else {
+            thread::yield_now();
+        }
+    }
+
+    fn delay(&self) -> Duration {
+        let active_requests = self.load.active_requests() as u64;
+        let active_file_streams = self.load.active_file_stream_count() as u64;
+        let latency = self.load.latency_ewma_ms();
+        let mut delay_ms = 0;
+        if active_requests > 0 {
+            delay_ms += 5 * active_requests.min(4);
+        }
+        if active_file_streams > 0 {
+            delay_ms += 25 * active_file_streams.min(4);
+        }
+        if latency > INDEX_SCAN_TARGET_LATENCY_MS {
+            delay_ms += (latency - INDEX_SCAN_TARGET_LATENCY_MS).min(INDEX_SCAN_MAX_DELAY_MS);
+        }
+        Duration::from_millis(delay_ms.min(INDEX_SCAN_MAX_DELAY_MS))
+    }
 }
 
 impl IndexDb {
@@ -276,6 +373,7 @@ impl IndexDb {
         db_path: PathBuf,
         hidden: Vec<String>,
         follow_symlinks: bool,
+        load: Arc<ServerLoad>,
     ) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(
@@ -287,26 +385,48 @@ impl IndexDb {
                 size UBIGINT NOT NULL,
                 mtime UBIGINT NOT NULL,
                 hidden BOOLEAN NOT NULL,
+                scan_generation UBIGINT NOT NULL DEFAULT 0,
                 indexed_at TIMESTAMP NOT NULL DEFAULT current_timestamp
             );
             CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
             CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
             CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN scan_generation UBIGINT DEFAULT 0",
+            [],
+        );
+        let generation = conn.query_row(
+            "SELECT coalesce(max(scan_generation), 0) FROM files",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(Self {
             conn,
             serve_path,
             hidden,
             follow_symlinks,
+            generation,
+            throttle: IndexThrottle::new(load),
         })
     }
 
     fn full_scan(&mut self) -> Result<()> {
-        self.conn.execute("DELETE FROM files", [])?;
-        self.scan_path(&self.serve_path.clone())
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        self.scan_path_with_generation(&self.serve_path.clone(), generation)?;
+        self.conn.execute(
+            "DELETE FROM files WHERE scan_generation <> ?",
+            params![generation],
+        )?;
+        Ok(())
     }
 
     fn scan_path(&mut self, path: &Path) -> Result<()> {
+        self.scan_path_with_generation(path, self.generation)
+    }
+
+    fn scan_path_with_generation(&mut self, path: &Path, generation: u64) -> Result<()> {
         if path.is_dir() {
             for result in WalkBuilder::new(path)
                 .hidden(false)
@@ -323,15 +443,21 @@ impl IndexDb {
                 if entry_path == self.serve_path {
                     continue;
                 }
-                self.upsert_path(entry_path)?;
+                self.upsert_path_with_generation(entry_path, generation)?;
+                self.throttle.step();
             }
         } else {
-            self.upsert_path(path)?;
+            self.upsert_path_with_generation(path, generation)?;
+            self.throttle.step();
         }
         Ok(())
     }
 
     fn upsert_path(&mut self, path: &Path) -> Result<()> {
+        self.upsert_path_with_generation(path, self.generation)
+    }
+
+    fn upsert_path_with_generation(&mut self, path: &Path, generation: u64) -> Result<()> {
         if !path.exists() {
             return self.remove_path(path);
         }
@@ -377,9 +503,9 @@ impl IndexDb {
             .map(to_timestamp)
             .unwrap_or_default();
         self.conn.execute(
-            "INSERT OR REPLACE INTO files (path, parent, name, path_type, size, mtime, hidden, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, false, current_timestamp)",
-            params![rel, parent, name, path_type, size, mtime],
+            "INSERT OR REPLACE INTO files (path, parent, name, path_type, size, mtime, hidden, scan_generation, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?, false, ?, current_timestamp)",
+            params![rel, parent, name, path_type, size, mtime, generation],
         )?;
         Ok(())
     }

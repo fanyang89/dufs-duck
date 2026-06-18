@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
-use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
-use crate::indexer::Indexer;
+use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream, TrackedStream};
+use crate::indexer::{Indexer, ServerLoad};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
 use crate::Args;
@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
@@ -70,6 +70,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    load: Arc<ServerLoad>,
     indexer: Option<Indexer>,
 }
 
@@ -93,6 +94,7 @@ impl Server {
             Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
             None => Cow::Borrowed(INDEX_HTML),
         };
+        let load = Arc::new(ServerLoad::default());
         let indexer = if args.enable_index {
             let db_path = args
                 .index_db
@@ -106,6 +108,7 @@ impl Server {
                 args.index_watch,
                 args.index_scan_interval,
                 running.clone(),
+                load.clone(),
             )?)
         } else {
             None
@@ -116,6 +119,7 @@ impl Server {
             single_file_req_paths,
             assets_prefix,
             html,
+            load,
             indexer,
         })
     }
@@ -126,6 +130,8 @@ impl Server {
         addr: Option<SocketAddr>,
     ) -> Result<Response, hyper::Error> {
         let uri = req.uri().clone();
+        let start = Instant::now();
+        self.load.begin_request();
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
         let mut http_log_data = self.args.http_logger.data(&req);
@@ -152,6 +158,8 @@ impl Server {
                 res
             }
         };
+
+        self.load.end_request(start.elapsed());
 
         if enable_cors {
             add_cors(&mut res);
@@ -727,7 +735,10 @@ impl Server {
                 error!("Failed to zip {}, {e}", path.display());
             }
         });
-        let reader_stream = ReaderStream::with_capacity(reader, BUF_SIZE);
+        let reader_stream = TrackedStream::new(
+            ReaderStream::with_capacity(reader, BUF_SIZE),
+            self.load.active_file_streams(),
+        );
         let stream_body = StreamBody::new(
             reader_stream
                 .map_ok(Frame::data)
@@ -1034,9 +1045,12 @@ impl Server {
                     }
 
                     let stream_body = StreamBody::new(
-                        LengthLimitedStream::new(file, range_size as usize)
-                            .map_ok(Frame::data)
-                            .map_err(|err| anyhow!("{err}")),
+                        TrackedStream::new(
+                            LengthLimitedStream::new(file, range_size as usize),
+                            self.load.active_file_streams(),
+                        )
+                        .map_ok(Frame::data)
+                        .map_err(|err| anyhow!("{err}")),
                     );
                     let boxed_body = stream_body.boxed();
                     *res.body_mut() = boxed_body;
@@ -1082,7 +1096,10 @@ impl Server {
                 return Ok(());
             }
 
-            let reader_stream = ReaderStream::with_capacity(file, BUF_SIZE);
+            let reader_stream = TrackedStream::new(
+                ReaderStream::with_capacity(file, BUF_SIZE),
+                self.load.active_file_streams(),
+            );
             let stream_body = StreamBody::new(
                 reader_stream
                     .map_ok(Frame::data)

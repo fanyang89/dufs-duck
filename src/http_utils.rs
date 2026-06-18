@@ -4,6 +4,10 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use std::{
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tokio::io::AsyncRead;
@@ -95,6 +99,32 @@ impl<R: AsyncRead> Stream for LengthLimitedStream<R> {
                 Poll::Ready(Some(Ok(chunk.freeze())))
             }
         }
+    }
+}
+
+pub struct TrackedStream<S> {
+    inner: S,
+    counter: Arc<AtomicUsize>,
+}
+
+impl<S> TrackedStream<S> {
+    pub fn new(inner: S, counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { inner, counter }
+    }
+}
+
+impl<S> Drop for TrackedStream<S> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl<S: Stream + Unpin> Stream for TrackedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
