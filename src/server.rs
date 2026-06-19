@@ -62,6 +62,7 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 const INDEX_DB_PATH: &str = "__dufs__/index.duckdb";
+const INDEX_STATUS_PATH: &str = "__dufs__/index/status";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 pub struct Server {
@@ -264,6 +265,11 @@ impl Server {
         if relative_path == INDEX_DB_PATH {
             self.handle_index_db(headers, head_only, access_paths, &mut res)
                 .await?;
+            return Ok(res);
+        }
+
+        if relative_path == INDEX_STATUS_PATH {
+            self.handle_index_status(head_only, &mut res)?;
             return Ok(res);
         }
 
@@ -781,6 +787,42 @@ impl Server {
         }
         self.handle_send_file(snapshot_path, headers, head_only, res)
             .await?;
+        Ok(())
+    }
+
+    fn handle_index_status(&self, head_only: bool, res: &mut Response) -> Result<()> {
+        let status = if let Some(indexer) = &self.indexer {
+            let status = indexer.status();
+            serde_json::json!({
+                "enabled": true,
+                "remote": self.args.index_remote,
+                "ready": status.ready,
+                "scanning": status.scanning,
+                "indexed_count": status.indexed_count,
+                "last_scan_at": status.last_scan_at,
+                "last_snapshot_at": status.last_snapshot_at,
+                "last_error": status.last_error,
+            })
+        } else {
+            serde_json::json!({
+                "enabled": false,
+                "remote": false,
+                "ready": false,
+                "scanning": false,
+                "indexed_count": 0,
+                "last_scan_at": null,
+                "last_snapshot_at": null,
+                "last_error": null,
+            })
+        };
+        let output = serde_json::to_string_pretty(&status)?;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        if !head_only {
+            *res.body_mut() = body_full(output);
+        }
         Ok(())
     }
 

@@ -5,9 +5,10 @@ use anyhow::Result;
 use duckdb::{params, Connection};
 use ignore::WalkBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::oneshot;
@@ -62,6 +63,17 @@ impl ServerLoad {
 pub struct Indexer {
     tx: mpsc::Sender<IndexCommand>,
     snapshot_path: PathBuf,
+    status: Arc<Mutex<IndexStatus>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IndexStatus {
+    pub ready: bool,
+    pub scanning: bool,
+    pub indexed_count: u64,
+    pub last_scan_at: Option<u64>,
+    pub last_snapshot_at: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 enum IndexCommand {
@@ -98,6 +110,8 @@ impl Indexer {
         }
         let snapshot_path = Self::snapshot_path(&db_path);
         let worker_snapshot_path = snapshot_path.clone();
+        let status = Arc::new(Mutex::new(IndexStatus::default()));
+        let worker_status = status.clone();
         let (tx, rx) = mpsc::channel();
         let watch_path = serve_path.clone();
         let worker_tx = tx.clone();
@@ -111,12 +125,17 @@ impl Indexer {
                 hidden,
                 follow_symlinks,
                 load,
+                worker_status,
                 worker_running,
             ) {
                 error!("indexer stopped: {err}");
             }
         });
-        let indexer = Self { tx, snapshot_path };
+        let indexer = Self {
+            tx,
+            snapshot_path,
+            status,
+        };
         indexer.full_scan();
         if watch {
             indexer.start_watcher(watch_path, worker_tx.clone(), running.clone());
@@ -137,6 +156,13 @@ impl Indexer {
 
     pub fn readonly_snapshot_path(&self) -> &Path {
         &self.snapshot_path
+    }
+
+    pub fn status(&self) -> IndexStatus {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_default()
     }
 
     pub fn full_scan(&self) {
@@ -240,6 +266,7 @@ fn run_worker(
     hidden: Vec<String>,
     follow_symlinks: bool,
     load: Arc<ServerLoad>,
+    status: Arc<Mutex<IndexStatus>>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut db = IndexDb::new(
@@ -256,8 +283,18 @@ fn run_worker(
         let Ok(cmd) = rx.recv_timeout(Duration::from_millis(200)) else {
             if snapshot_dirty && snapshot_dirty_at.elapsed() >= INDEX_SNAPSHOT_DEBOUNCE {
                 if let Err(err) = db.refresh_snapshot() {
+                    update_status(&status, |status| {
+                        status.last_error = Some(err.to_string());
+                    });
                     warn!("failed to refresh index snapshot: {err}");
                 } else {
+                    let indexed_count = db.indexed_count().unwrap_or_default();
+                    update_status(&status, |status| {
+                        status.ready = true;
+                        status.indexed_count = indexed_count;
+                        status.last_snapshot_at = Some(now_millis());
+                        status.last_error = None;
+                    });
                     snapshot_dirty = false;
                 }
             }
@@ -265,9 +302,26 @@ fn run_worker(
         };
         match cmd {
             IndexCommand::FullScan => {
+                update_status(&status, |status| {
+                    status.scanning = true;
+                    status.last_error = None;
+                });
                 if let Err(err) = db.full_scan() {
+                    update_status(&status, |status| {
+                        status.scanning = false;
+                        status.last_error = Some(err.to_string());
+                    });
                     warn!("failed to scan index: {err}");
                 } else {
+                    let indexed_count = db.indexed_count().unwrap_or_default();
+                    update_status(&status, |status| {
+                        status.ready = true;
+                        status.scanning = false;
+                        status.indexed_count = indexed_count;
+                        status.last_scan_at = Some(now_millis());
+                        status.last_snapshot_at = Some(now_millis());
+                        status.last_error = None;
+                    });
                     snapshot_dirty = false;
                 }
             }
@@ -319,6 +373,12 @@ fn run_worker(
         }
     }
     Ok(())
+}
+
+fn update_status(status: &Arc<Mutex<IndexStatus>>, update: impl FnOnce(&mut IndexStatus)) {
+    if let Ok(mut status) = status.lock() {
+        update(&mut status);
+    }
 }
 
 struct IndexDb {
@@ -595,6 +655,12 @@ impl IndexDb {
         })?;
         rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
     }
+
+    fn indexed_count(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
 }
 
 fn handle_notify_event(tx: &mpsc::Sender<IndexCommand>, event: notify::Event) {
@@ -664,4 +730,8 @@ fn to_timestamp(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn now_millis() -> u64 {
+    to_timestamp(SystemTime::now())
 }

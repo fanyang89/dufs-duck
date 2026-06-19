@@ -181,6 +181,33 @@ fn indexed_remote_db_forbidden(
 }
 
 #[rstest]
+fn index_status_disabled(server: TestServer) -> Result<(), Error> {
+    let resp = reqwest::blocking::get(format!("{}__dufs__/index/status", server.url()))?;
+    assert_eq!(resp.status(), 200);
+    let value: Value = serde_json::from_str(&resp.text()?)?;
+    assert_eq!(value["enabled"], false);
+    assert_eq!(value["ready"], false);
+    Ok(())
+}
+
+#[rstest]
+fn index_status_ready(
+    #[with(&["-A", "--enable-index", "--index-remote", "--index-scan-interval", "0"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let value = wait_json_value(
+        || reqwest::blocking::get(format!("{}__dufs__/index/status", server.url())),
+        |value| value["ready"] == true,
+    )?;
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["remote"], true);
+    assert!(value["indexed_count"].as_u64().unwrap_or_default() > 0);
+    assert!(value["last_scan_at"].as_u64().is_some());
+    assert!(value["last_snapshot_at"].as_u64().is_some());
+    Ok(())
+}
+
+#[rstest]
 fn get_dir_search2(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let resp = reqwest::blocking::get(format!("{}?q={BIN_FILE}", server.url()))?;
     assert_eq!(resp.status(), 200);
@@ -510,6 +537,23 @@ where
         if resp.status() == 200 || start.elapsed() > Duration::from_secs(5) {
             assert_eq!(resp.status(), 200);
             return Ok(resp);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_json_value<F, P>(mut fetch: F, predicate: P) -> Result<Value, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+    P: Fn(&Value) -> bool,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        assert_eq!(resp.status(), 200);
+        let value: Value = serde_json::from_str(&resp.text()?)?;
+        if predicate(&value) || start.elapsed() > Duration::from_secs(5) {
+            return Ok(value);
         }
         sleep(Duration::from_millis(100));
     }
