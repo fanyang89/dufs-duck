@@ -631,40 +631,7 @@ impl IndexDb {
         load: Arc<ServerLoad>,
     ) -> Result<Self> {
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS files (
-                path TEXT PRIMARY KEY,
-                parent TEXT NOT NULL,
-                name TEXT NOT NULL,
-                path_type TEXT NOT NULL,
-                size UBIGINT NOT NULL,
-                mtime UBIGINT NOT NULL,
-                hidden BOOLEAN NOT NULL,
-                scan_generation UBIGINT NOT NULL DEFAULT 0,
-                indexed_at TIMESTAMP NOT NULL DEFAULT current_timestamp
-            );
-            CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
-            CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
-            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );",
-        )?;
-        let _ = conn.execute(
-            "ALTER TABLE files ADD COLUMN scan_generation UBIGINT DEFAULT 0",
-            [],
-        );
-        conn.execute(
-            "INSERT INTO metadata (key, value)
-             SELECT 'created_at', ?
-             WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = 'created_at')",
-            params![now_millis().to_string()],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?), ('updated_at', ?)",
-            params![INDEX_SCHEMA_VERSION.to_string(), now_millis().to_string()],
-        )?;
+        init_schema(&conn)?;
         let generation = conn.query_row(
             "SELECT coalesce(max(scan_generation), 0) FROM files",
             [],
@@ -866,6 +833,65 @@ impl IndexDb {
             .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
             .map_err(Into::into)
     }
+}
+
+fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            parent TEXT NOT NULL,
+            name TEXT NOT NULL,
+            path_type TEXT NOT NULL,
+            size UBIGINT NOT NULL,
+            mtime UBIGINT NOT NULL,
+            hidden BOOLEAN NOT NULL,
+            scan_generation UBIGINT NOT NULL DEFAULT 0,
+            indexed_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+        );
+        CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
+        CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+        CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+    let from = schema_version(conn)?;
+    migrate_schema(conn, from, INDEX_SCHEMA_VERSION)?;
+    conn.execute(
+        "INSERT INTO metadata (key, value)
+         SELECT 'created_at', ?
+         WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = 'created_at')",
+        params![now_millis().to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?), ('updated_at', ?)",
+        params![INDEX_SCHEMA_VERSION.to_string(), now_millis().to_string()],
+    )?;
+    Ok(())
+}
+
+fn schema_version(conn: &Connection) -> Result<u64> {
+    let version = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    Ok(version)
+}
+
+fn migrate_schema(conn: &Connection, from: u64, to: u64) -> Result<()> {
+    if from < 1 && to >= 1 {
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN scan_generation UBIGINT DEFAULT 0",
+            [],
+        );
+    }
+    Ok(())
 }
 
 fn collect_notify_event(pending: &mut HashMap<PathBuf, WatchAction>, event: notify::Event) {
