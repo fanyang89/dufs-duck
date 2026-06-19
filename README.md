@@ -68,6 +68,13 @@ Options:
       --allow-symlink        Allow symlink to files/folders outside root directory
       --allow-archive        Allow download folders as archive file
       --allow-hash           Allow ?hash query to get file sha256 hash
+      --enable-index         Enable DuckDB file indexing
+      --index-db <file>      Path to the DuckDB index database
+      --index-remote         Expose a read-only DuckDB index snapshot over HTTP
+      --index-watch          Watch the file system and update the index
+      --no-index-watch       Disable file system watching for the index
+      --index-scan-interval <seconds>
+                             Periodic index scan interval in seconds, 0 disables it
       --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
       --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
       --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
@@ -194,6 +201,12 @@ List/search directory contents
 curl http://127.0.0.1:5000?q=Dockerfile           # search for files, similar to `find -name Dockerfile`
 curl http://127.0.0.1:5000?simple                 # output names only, similar to `ls -1`
 curl http://127.0.0.1:5000?json                   # output paths in json format
+```
+
+DuckDB index status
+
+```sh
+curl http://127.0.0.1:5000/__dufs__/index/status
 ```
 
 With authorization (Both basic or digest auth works)
@@ -336,6 +349,56 @@ dufs --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admi
 2022-08-06T07:04:37+08:00 INFO - 127.0.0.1 admin "GET /" 200
 ```
 
+### DuckDB Index
+
+Dufs can maintain a DuckDB index for file names and paths. The index is useful for large directories where real-time recursive search is expensive.
+
+```sh
+dufs -A --enable-index
+```
+
+When indexing is enabled:
+
+- Startup triggers a background full scan.
+- Search requests such as `?q=report` use the DuckDB index.
+- The file system watcher updates the index for external changes by default.
+- A periodic scan runs every 300 seconds by default; set `--index-scan-interval 0` to disable it.
+- The index respects dufs access permissions for search results.
+- The index only stores file metadata such as path, name, type, size, and mtime. It does not index file contents.
+- The index traversal uses ignore rules such as `.gitignore` and `.ignore`.
+
+By default, the live database is stored at `<serve-path>/.dufs/index.duckdb`. Use `--index-db <file>` to choose another path.
+
+#### Remote Read-Only DuckDB
+
+Use `--index-remote` to expose a read-only DuckDB snapshot at `__dufs__/index.duckdb`.
+
+```sh
+dufs -A --enable-index --index-remote
+```
+
+Only users with full root access can download the remote index snapshot. Users with partial path access receive `403 Forbidden`, because the snapshot contains metadata for the whole indexed tree.
+
+Query it from DuckDB with the `httpfs` extension:
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+ATTACH 'http://127.0.0.1:5000/__dufs__/index.duckdb' AS dufs_index;
+SELECT path, size, mtime FROM dufs_index.files WHERE lower(path) LIKE '%jpg%';
+```
+
+For authenticated servers, include a token in the URL or use an HTTP client setup supported by DuckDB/httpfs.
+
+Check index status:
+
+```sh
+curl http://127.0.0.1:5000/__dufs__/index/status
+```
+
+The response includes whether indexing is ready, whether a scan is running, indexed file count, schema version, last scan time, last snapshot time, and the last indexer error if any.
+
 ## Environment variables
 
 All options can be set using environment variables prefixed with `DUFS_`.
@@ -355,6 +418,12 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --allow-symlink         DUFS_ALLOW_SYMLINK=true
     --allow-archive         DUFS_ALLOW_ARCHIVE=true
     --allow-hash            DUFS_ALLOW_HASH=true
+    --enable-index          DUFS_ENABLE_INDEX=true
+    --index-db <file>       DUFS_INDEX_DB=./.dufs/index.duckdb
+    --index-remote          DUFS_INDEX_REMOTE=true
+    --index-watch           DUFS_INDEX_WATCH=true
+    --no-index-watch        DUFS_NO_INDEX_WATCH=true
+    --index-scan-interval   DUFS_INDEX_SCAN_INTERVAL=300
     --enable-cors           DUFS_ENABLE_CORS=true
     --render-index          DUFS_RENDER_INDEX=true
     --render-try-index      DUFS_RENDER_TRY_INDEX=true
@@ -393,6 +462,11 @@ allow-search: true
 allow-symlink: true
 allow-archive: true
 allow-hash: true
+enable-index: true
+index-db: ./.dufs/index.duckdb
+index-remote: true
+index-watch: true
+index-scan-interval: 300
 enable-cors: true
 render-index: true
 render-try-index: true
