@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::oneshot;
 
 const INDEX_SCAN_BATCH_SIZE: usize = 128;
 const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
 const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
+const INDEX_SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct ServerLoad {
@@ -249,42 +250,61 @@ fn run_worker(
         follow_symlinks,
         load,
     )?;
+    let mut snapshot_dirty = false;
+    let mut snapshot_dirty_at = Instant::now();
     while running.load(Ordering::SeqCst) {
-        let Ok(cmd) = rx.recv_timeout(Duration::from_secs(1)) else {
+        let Ok(cmd) = rx.recv_timeout(Duration::from_millis(200)) else {
+            if snapshot_dirty && snapshot_dirty_at.elapsed() >= INDEX_SNAPSHOT_DEBOUNCE {
+                if let Err(err) = db.refresh_snapshot() {
+                    warn!("failed to refresh index snapshot: {err}");
+                } else {
+                    snapshot_dirty = false;
+                }
+            }
             continue;
         };
         match cmd {
             IndexCommand::FullScan => {
                 if let Err(err) = db.full_scan() {
                     warn!("failed to scan index: {err}");
+                } else {
+                    snapshot_dirty = false;
                 }
             }
             IndexCommand::ScanPath(path) => {
-                if let Err(err) = db.scan_path(&path).and_then(|_| db.refresh_snapshot()) {
+                if let Err(err) = db.scan_path(&path) {
                     warn!("failed to scan {}: {err}", path.display());
+                } else {
+                    snapshot_dirty = true;
+                    snapshot_dirty_at = Instant::now();
                 }
             }
             IndexCommand::UpsertPath(path) => {
-                if let Err(err) = db.upsert_path(&path).and_then(|_| db.refresh_snapshot()) {
+                if let Err(err) = db.upsert_path(&path) {
                     warn!("failed to index {}: {err}", path.display());
+                } else {
+                    snapshot_dirty = true;
+                    snapshot_dirty_at = Instant::now();
                 }
             }
             IndexCommand::RemovePath(path) => {
-                if let Err(err) = db.remove_path(&path).and_then(|_| db.refresh_snapshot()) {
+                if let Err(err) = db.remove_path(&path) {
                     warn!("failed to remove {} from index: {err}", path.display());
+                } else {
+                    snapshot_dirty = true;
+                    snapshot_dirty_at = Instant::now();
                 }
             }
             IndexCommand::MovePath { from, to } => {
-                if let Err(err) = db
-                    .remove_path(&from)
-                    .and_then(|_| db.scan_path(&to))
-                    .and_then(|_| db.refresh_snapshot())
-                {
+                if let Err(err) = db.remove_path(&from).and_then(|_| db.scan_path(&to)) {
                     warn!(
                         "failed to move index entry {} -> {}: {err}",
                         from.display(),
                         to.display()
                     );
+                } else {
+                    snapshot_dirty = true;
+                    snapshot_dirty_at = Instant::now();
                 }
             }
             IndexCommand::Search {
