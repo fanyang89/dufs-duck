@@ -211,6 +211,7 @@ fn index_status_disabled(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 200);
     let value: Value = serde_json::from_str(&resp.text()?)?;
     assert_eq!(value["enabled"], false);
+    assert_eq!(value["schema_version"], 0);
     assert_eq!(value["ready"], false);
     Ok(())
 }
@@ -226,6 +227,7 @@ fn index_status_ready(
     )?;
     assert_eq!(value["enabled"], true);
     assert_eq!(value["remote"], true);
+    assert_eq!(value["schema_version"], 1);
     assert!(value["indexed_count"].as_u64().unwrap_or_default() > 0);
     assert!(value["last_scan_at"].as_u64().is_some());
     assert!(value["last_snapshot_at"].as_u64().is_some());

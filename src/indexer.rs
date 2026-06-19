@@ -19,6 +19,7 @@ const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
 const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
 const INDEX_SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(1);
 const INDEX_WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+const INDEX_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Copy)]
 enum WatchAction {
@@ -76,6 +77,7 @@ pub struct Indexer {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IndexStatus {
+    pub schema_version: u64,
     pub ready: bool,
     pub scanning: bool,
     pub indexed_count: u64,
@@ -299,6 +301,9 @@ fn run_worker(
         follow_symlinks,
         load,
     )?;
+    update_status(&status, |status| {
+        status.schema_version = INDEX_SCHEMA_VERSION;
+    });
     let mut snapshot_dirty = false;
     let mut snapshot_dirty_at = Instant::now();
     while running.load(Ordering::SeqCst) {
@@ -552,12 +557,26 @@ impl IndexDb {
             );
             CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
             CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
-            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
+            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )?;
         let _ = conn.execute(
             "ALTER TABLE files ADD COLUMN scan_generation UBIGINT DEFAULT 0",
             [],
         );
+        conn.execute(
+            "INSERT INTO metadata (key, value)
+             SELECT 'created_at', ?
+             WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = 'created_at')",
+            params![now_millis().to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?), ('updated_at', ?)",
+            params![INDEX_SCHEMA_VERSION.to_string(), now_millis().to_string()],
+        )?;
         let generation = conn.query_row(
             "SELECT coalesce(max(scan_generation), 0) FROM files",
             [],

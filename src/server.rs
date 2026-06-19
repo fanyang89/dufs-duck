@@ -817,6 +817,7 @@ impl Server {
             serde_json::json!({
                 "enabled": true,
                 "remote": self.args.index_remote,
+                "schema_version": status.schema_version,
                 "ready": status.ready,
                 "scanning": status.scanning,
                 "indexed_count": status.indexed_count,
@@ -828,6 +829,7 @@ impl Server {
             serde_json::json!({
                 "enabled": false,
                 "remote": false,
+                "schema_version": 0,
                 "ready": false,
                 "scanning": false,
                 "indexed_count": 0,
