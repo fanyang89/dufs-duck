@@ -6,6 +6,7 @@ use duckdb::{params, Connection};
 use ignore::WalkBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -17,6 +18,13 @@ const INDEX_SCAN_BATCH_SIZE: usize = 128;
 const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
 const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
 const INDEX_SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(1);
+const INDEX_WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy)]
+enum WatchAction {
+    Scan,
+    Remove,
+}
 
 #[derive(Debug, Default)]
 pub struct ServerLoad {
@@ -225,10 +233,12 @@ impl Indexer {
         running: Arc<AtomicBool>,
     ) {
         thread::spawn(move || {
-            let callback_tx = tx.clone();
+            let (event_tx, event_rx) = mpsc::channel();
             let mut watcher = match RecommendedWatcher::new(
                 move |res: notify::Result<notify::Event>| match res {
-                    Ok(event) => handle_notify_event(&callback_tx, event),
+                    Ok(event) => {
+                        let _ = event_tx.send(event);
+                    }
                     Err(err) => warn!("index watcher error: {err}"),
                 },
                 notify::Config::default(),
@@ -243,9 +253,15 @@ impl Indexer {
                 error!("failed to watch {}: {err}", watch_path.display());
                 return;
             }
+            let mut pending = HashMap::new();
             while running.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(1));
+                match event_rx.recv_timeout(INDEX_WATCH_DEBOUNCE) {
+                    Ok(event) => collect_notify_event(&mut pending, event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => flush_watch_events(&tx, &mut pending),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
+            flush_watch_events(&tx, &mut pending);
         });
     }
 }
@@ -745,19 +761,32 @@ impl IndexDb {
     }
 }
 
-fn handle_notify_event(tx: &mpsc::Sender<IndexCommand>, event: notify::Event) {
+fn collect_notify_event(pending: &mut HashMap<PathBuf, WatchAction>, event: notify::Event) {
     if event.kind.is_create() || event.kind.is_modify() {
         for path in event.paths {
-            let _ = tx.send(IndexCommand::ScanPath(path));
+            pending.insert(path, WatchAction::Scan);
         }
     } else if event.kind.is_remove() {
         for path in event.paths {
-            let _ = tx.send(IndexCommand::RemovePath(path));
+            pending.insert(path, WatchAction::Remove);
         }
     } else if matches!(event.kind, EventKind::Modify(_)) {
         for path in event.paths {
-            let _ = tx.send(IndexCommand::ScanPath(path));
+            pending.insert(path, WatchAction::Scan);
         }
+    }
+}
+
+fn flush_watch_events(
+    tx: &mpsc::Sender<IndexCommand>,
+    pending: &mut HashMap<PathBuf, WatchAction>,
+) {
+    for (path, action) in pending.drain() {
+        let cmd = match action {
+            WatchAction::Scan => IndexCommand::ScanPath(path),
+            WatchAction::Remove => IndexCommand::RemovePath(path),
+        };
+        let _ = tx.send(cmd);
     }
 }
 
