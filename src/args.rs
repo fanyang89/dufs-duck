@@ -545,6 +545,13 @@ impl Args {
             args.tls_key = None;
         }
 
+        if args.index_remote && !args.enable_index {
+            bail!("--index-remote requires --enable-index");
+        }
+        if args.index_remote && args.index_snapshot_interval == 0 {
+            warn!("--index-snapshot-interval 0 disables incremental remote index snapshots");
+        }
+
         Ok(args)
     }
 
@@ -802,6 +809,16 @@ mod tests {
         let args = Args::parse(matches).unwrap();
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
         assert_eq!(args.index_snapshot_interval, 9);
+    }
+
+    #[test]
+    fn test_index_remote_requires_index() {
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--index-remote"])
+            .unwrap();
+        let err = Args::parse(matches).unwrap_err().to_string();
+        assert!(err.contains("--index-remote requires --enable-index"));
     }
 
     #[test]
