@@ -402,6 +402,24 @@ curl http://127.0.0.1:5000/__dufs__/index/status
 
 The response includes whether indexing is ready, whether a scan is running, indexed file count, queued command count, schema version, watcher settings, snapshot settings, last scan/snapshot timings, and the last indexer error if any.
 
+#### Production Checklist
+
+Before enabling the DuckDB index on a large production tree, run these checks in an environment close to production:
+
+1. Start with `--enable-index` and verify `__dufs__/index/status` becomes ready.
+2. Confirm indexed search results match expected access-control rules for full-access and partial-access users.
+3. Create, delete, and rename files outside dufs, then confirm the watcher updates search results.
+4. Disable the watcher with `--no-index-watch --index-scan-interval 1` in a test run, then confirm the periodic scan repairs missed changes.
+5. Download a large file while the initial scan is running and confirm file-serving latency remains acceptable.
+6. If `--index-remote` is enabled, confirm only full-root-access users can download `__dufs__/index.duckdb`.
+7. Verify remote DuckDB access from the target environment:
+
+```sh
+DUFS_TEST_DUCKDB_HTTPFS=1 cargo test duckdb_httpfs_remote_index --test http
+```
+
+For larger deployments, also measure initial scan duration, indexed search latency, snapshot size, snapshot refresh duration, and queued command count under a bulk file-change workload.
+
 ## Environment variables
 
 All options can be set using environment variables prefixed with `DUFS_`.
