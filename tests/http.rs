@@ -158,6 +158,78 @@ fn indexed_search_updates_after_write(
 }
 
 #[rstest]
+fn indexed_external_create_delete_rename(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    let new_path = server.path().join("external-new.txt");
+    std::fs::write(&new_path, b"external")?;
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "external-new.txt")),
+        "external-new.txt",
+    )?;
+    assert!(text.lines().any(|v| v == "external-new.txt"));
+
+    let renamed_path = server.path().join("external-renamed.txt");
+    std::fs::rename(&new_path, &renamed_path)?;
+    let text = wait_text_contains(
+        || {
+            reqwest::blocking::get(format!(
+                "{}?q={}&simple",
+                server.url(),
+                "external-renamed.txt"
+            ))
+        },
+        "external-renamed.txt",
+    )?;
+    assert!(text.lines().any(|v| v == "external-renamed.txt"));
+    let text = wait_text_not_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "external-new.txt")),
+        "external-new.txt",
+    )?;
+    assert!(!text.contains("external-new.txt"));
+
+    std::fs::remove_file(&renamed_path)?;
+    let text = wait_text_not_contains(
+        || {
+            reqwest::blocking::get(format!(
+                "{}?q={}&simple",
+                server.url(),
+                "external-renamed.txt"
+            ))
+        },
+        "external-renamed.txt",
+    )?;
+    assert!(!text.contains("external-renamed.txt"));
+    Ok(())
+}
+
+#[rstest]
+fn indexed_external_periodic_scan(
+    #[with(&[
+        "-A",
+        "--enable-index",
+        "--no-index-watch",
+        "--index-scan-interval",
+        "1"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    std::fs::write(server.path().join("external-periodic.txt"), b"external")?;
+    let text = wait_text_contains(
+        || {
+            reqwest::blocking::get(format!(
+                "{}?q={}&simple",
+                server.url(),
+                "external-periodic.txt"
+            ))
+        },
+        "external-periodic.txt",
+    )?;
+    assert!(text.lines().any(|v| v == "external-periodic.txt"));
+    Ok(())
+}
+
+#[rstest]
 fn indexed_remote_db(
     #[with(&["-A", "--enable-index", "--index-remote", "--index-scan-interval", "0"])]
     server: TestServer,
