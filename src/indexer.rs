@@ -423,10 +423,13 @@ impl IndexDb {
     }
 
     fn scan_path_with_generation(&mut self, path: &Path, generation: u64) -> Result<()> {
-        if path.is_dir() {
+        let is_dir = std::fs::symlink_metadata(path)
+            .map(|meta| meta.is_dir())
+            .unwrap_or_else(|_| path.is_dir());
+        if is_dir {
             for result in WalkBuilder::new(path)
                 .hidden(false)
-                .follow_links(true)
+                .follow_links(self.follow_symlinks)
                 .git_ignore(true)
                 .git_global(true)
                 .ignore(true)

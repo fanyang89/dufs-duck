@@ -4,6 +4,8 @@ mod utils;
 use assert_fs::fixture::TempDir;
 use fixtures::{server, tmpdir, Error, TestServer};
 use rstest::rstest;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_dir;
@@ -43,4 +45,36 @@ fn allow_symlink(
     assert!(!paths.is_empty());
     assert!(paths.contains(&format!("{dir}/")));
     Ok(())
+}
+
+#[rstest]
+fn indexed_search_does_not_follow_symlink_by_default(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+    tmpdir: TempDir,
+) -> Result<(), Error> {
+    let dir = "foo";
+    std::fs::write(tmpdir.path().join("outside-only.txt"), b"outside")?;
+    symlink_dir(tmpdir.path(), server.path().join(dir)).expect("Couldn't create symlink");
+
+    let text = wait_text(|| {
+        reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "outside-only.txt"))
+    })?;
+    assert!(!text.contains("outside-only.txt"));
+    Ok(())
+}
+
+fn wait_text<F>(mut fetch: F) -> Result<String, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        assert_eq!(resp.status(), 200);
+        let text = resp.text()?;
+        if !text.contains("outside-only.txt") || start.elapsed() > Duration::from_secs(5) {
+            return Ok(text);
+        }
+        sleep(Duration::from_millis(100));
+    }
 }
