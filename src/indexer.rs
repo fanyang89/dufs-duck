@@ -112,6 +112,7 @@ impl Indexer {
         let worker_snapshot_path = snapshot_path.clone();
         let status = Arc::new(Mutex::new(IndexStatus::default()));
         let worker_status = status.clone();
+        let worker_error_status = status.clone();
         let (tx, rx) = mpsc::channel();
         let watch_path = serve_path.clone();
         let worker_tx = tx.clone();
@@ -128,6 +129,11 @@ impl Indexer {
                 worker_status,
                 worker_running,
             ) {
+                update_status(&worker_error_status, |status| {
+                    status.ready = false;
+                    status.scanning = false;
+                    status.last_error = Some(err.to_string());
+                });
                 error!("indexer stopped: {err}");
             }
         });

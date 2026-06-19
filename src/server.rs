@@ -666,36 +666,27 @@ impl Server {
 
         if !head_only {
             if let Some(indexer) = &self.indexer {
-                paths = indexer
+                match indexer
                     .search(
                         path,
                         search.clone(),
                         MAX_SUBPATHS_COUNT,
                         access_path_filters(&self.args.serve_path, &access_paths),
                     )
-                    .await?;
-            } else {
-                let path_buf = path.to_path_buf();
-                let hidden = Arc::new(self.args.hidden.to_vec());
-                let search = search.clone();
-
-                let search_paths = tokio::spawn(collect_dir_entries(
-                    access_paths.clone(),
-                    self.running.clone(),
-                    path_buf,
-                    hidden,
-                    self.args.allow_symlink,
-                    self.args.serve_path.clone(),
-                    move |x| get_file_name(x.path()).to_lowercase().contains(&search),
-                ))
-                .await?;
-
-                for search_path in search_paths.into_iter() {
-                    if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await
-                    {
-                        paths.push(item);
+                    .await
+                {
+                    Ok(indexed_paths) => paths = indexed_paths,
+                    Err(err) => {
+                        warn!("indexed search failed, falling back to directory scan: {err}");
+                        paths = self
+                            .collect_search_paths(path, &search, access_paths.clone())
+                            .await?;
                     }
                 }
+            } else {
+                paths = self
+                    .collect_search_paths(path, &search, access_paths.clone())
+                    .await?;
             }
         }
         self.send_index(
@@ -708,6 +699,36 @@ impl Server {
             access_paths,
             res,
         )
+    }
+
+    async fn collect_search_paths(
+        &self,
+        path: &Path,
+        search: &str,
+        access_paths: AccessPaths,
+    ) -> Result<Vec<PathItem>> {
+        let mut paths = vec![];
+        let path_buf = path.to_path_buf();
+        let hidden = Arc::new(self.args.hidden.to_vec());
+        let search = search.to_string();
+
+        let search_paths = tokio::spawn(collect_dir_entries(
+            access_paths,
+            self.running.clone(),
+            path_buf,
+            hidden,
+            self.args.allow_symlink,
+            self.args.serve_path.clone(),
+            move |x| get_file_name(x.path()).to_lowercase().contains(&search),
+        ))
+        .await?;
+
+        for search_path in search_paths.into_iter() {
+            if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
+                paths.push(item);
+            }
+        }
+        Ok(paths)
     }
 
     async fn handle_zip_dir(
