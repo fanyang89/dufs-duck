@@ -270,6 +270,33 @@ fn indexed_remote_db_head_and_range(
 }
 
 #[rstest]
+fn duckdb_httpfs_remote_index(
+    #[with(&["-A", "--enable-index", "--index-remote", "--index-scan-interval", "0"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    if std::env::var("DUFS_TEST_DUCKDB_HTTPFS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    let url = format!("{}__dufs__/index.duckdb", server.url());
+    wait_response_ok(|| reqwest::blocking::get(&url))?;
+
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+    conn.execute_batch(&format!("ATTACH '{url}' AS dufs_index;"))?;
+    let count: u64 = conn.query_row("SELECT count(*) FROM dufs_index.files", [], |row| {
+        row.get(0)
+    })?;
+    assert!(count > 0);
+    let path: String = conn.query_row(
+        "SELECT path FROM dufs_index.files WHERE path = 'test.html'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(path, "test.html");
+    Ok(())
+}
+
+#[rstest]
 fn indexed_remote_db_forbidden(
     #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
 ) -> Result<(), Error> {
