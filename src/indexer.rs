@@ -312,7 +312,10 @@ fn run_worker(
                     status.scanning = true;
                     status.last_error = None;
                 });
-                if let Err(err) = db.full_scan() {
+                let scan = db.full_scan_with_yield(|db| {
+                    drain_scan_commands(db, &rx, &mut snapshot_dirty, &mut snapshot_dirty_at);
+                });
+                if let Err(err) = scan {
                     update_status(&status, |status| {
                         status.scanning = false;
                         status.last_error = Some(err.to_string());
@@ -387,6 +390,66 @@ fn update_status(status: &Arc<Mutex<IndexStatus>>, update: impl FnOnce(&mut Inde
     }
 }
 
+fn drain_scan_commands(
+    db: &mut IndexDb,
+    rx: &mpsc::Receiver<IndexCommand>,
+    snapshot_dirty: &mut bool,
+    snapshot_dirty_at: &mut Instant,
+) {
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            IndexCommand::FullScan => {
+                // Coalesce full scans requested while one is already in progress.
+            }
+            IndexCommand::ScanPath(path) => {
+                if let Err(err) = db.scan_path(&path) {
+                    warn!("failed to scan {}: {err}", path.display());
+                } else {
+                    *snapshot_dirty = true;
+                    *snapshot_dirty_at = Instant::now();
+                }
+            }
+            IndexCommand::UpsertPath(path) => {
+                if let Err(err) = db.upsert_path(&path) {
+                    warn!("failed to index {}: {err}", path.display());
+                } else {
+                    *snapshot_dirty = true;
+                    *snapshot_dirty_at = Instant::now();
+                }
+            }
+            IndexCommand::RemovePath(path) => {
+                if let Err(err) = db.remove_path(&path) {
+                    warn!("failed to remove {} from index: {err}", path.display());
+                } else {
+                    *snapshot_dirty = true;
+                    *snapshot_dirty_at = Instant::now();
+                }
+            }
+            IndexCommand::MovePath { from, to } => {
+                if let Err(err) = db.remove_path(&from).and_then(|_| db.scan_path(&to)) {
+                    warn!(
+                        "failed to move index entry {} -> {}: {err}",
+                        from.display(),
+                        to.display()
+                    );
+                } else {
+                    *snapshot_dirty = true;
+                    *snapshot_dirty_at = Instant::now();
+                }
+            }
+            IndexCommand::Search {
+                base,
+                q,
+                limit,
+                access_paths,
+                reply,
+            } => {
+                let _ = reply.send(db.search(&base, &q, limit, &access_paths));
+            }
+        }
+    }
+}
+
 struct IndexDb {
     conn: Connection,
     db_path: PathBuf,
@@ -425,6 +488,10 @@ impl IndexThrottle {
         } else {
             thread::yield_now();
         }
+    }
+
+    fn is_batch_boundary(&self) -> bool {
+        self.processed == 0
     }
 
     fn delay(&self) -> Duration {
@@ -492,10 +559,10 @@ impl IndexDb {
         })
     }
 
-    fn full_scan(&mut self) -> Result<()> {
+    fn full_scan_with_yield(&mut self, mut on_batch: impl FnMut(&mut Self)) -> Result<()> {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        self.scan_path_with_generation(&self.serve_path.clone(), generation)?;
+        self.scan_path_with_generation(&self.serve_path.clone(), generation, &mut on_batch)?;
         self.conn.execute(
             "DELETE FROM files WHERE scan_generation <> ?",
             params![generation],
@@ -505,10 +572,15 @@ impl IndexDb {
     }
 
     fn scan_path(&mut self, path: &Path) -> Result<()> {
-        self.scan_path_with_generation(path, self.generation)
+        self.scan_path_with_generation(path, self.generation, &mut |_| {})
     }
 
-    fn scan_path_with_generation(&mut self, path: &Path, generation: u64) -> Result<()> {
+    fn scan_path_with_generation(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        on_batch: &mut impl FnMut(&mut Self),
+    ) -> Result<()> {
         let is_dir = std::fs::symlink_metadata(path)
             .map(|meta| meta.is_dir())
             .unwrap_or_else(|_| path.is_dir());
@@ -530,10 +602,14 @@ impl IndexDb {
                 }
                 self.upsert_path_with_generation(entry_path, generation)?;
                 self.throttle.step();
+                if self.throttle.is_batch_boundary() {
+                    on_batch(self);
+                }
             }
         } else {
             self.upsert_path_with_generation(path, generation)?;
             self.throttle.step();
+            on_batch(self);
         }
         Ok(())
     }
