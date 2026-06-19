@@ -317,6 +317,7 @@ fn index_status_disabled(server: TestServer) -> Result<(), Error> {
     assert_eq!(value["watch_enabled"], false);
     assert_eq!(value["scan_interval"], 0);
     assert_eq!(value["snapshot_interval"], 0);
+    assert_eq!(value["queued_commands"], 0);
     Ok(())
 }
 
@@ -336,6 +337,7 @@ fn index_status_ready(
     assert_eq!(value["scan_interval"], 0);
     assert_eq!(value["snapshot_interval"], 5);
     assert_eq!(value["snapshot_dirty"], false);
+    assert!(value["queued_commands"].as_u64().is_some());
     assert!(value["indexed_count"].as_u64().unwrap_or_default() > 0);
     assert!(value["last_scan_at"].as_u64().is_some());
     assert!(value["last_snapshot_at"].as_u64().is_some());

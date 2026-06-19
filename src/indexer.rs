@@ -69,9 +69,16 @@ impl ServerLoad {
 
 #[derive(Clone)]
 pub struct Indexer {
-    tx: mpsc::Sender<IndexCommand>,
+    queue: IndexQueue,
     snapshot_path: PathBuf,
     status: Arc<Mutex<IndexStatus>>,
+}
+
+#[derive(Clone)]
+struct IndexQueue {
+    tx: mpsc::Sender<IndexCommand>,
+    queued: Arc<AtomicUsize>,
+    full_scan_queued: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -84,6 +91,7 @@ pub struct IndexStatus {
     pub watch_enabled: bool,
     pub scan_interval: u64,
     pub snapshot_interval: u64,
+    pub queued_commands: usize,
     pub last_scan_at: Option<u64>,
     pub last_snapshot_at: Option<u64>,
     pub last_scan_duration_ms: Option<u64>,
@@ -107,6 +115,39 @@ enum IndexCommand {
         access_paths: Vec<String>,
         reply: oneshot::Sender<Result<Vec<PathItem>>>,
     },
+}
+
+impl IndexQueue {
+    fn new(tx: mpsc::Sender<IndexCommand>) -> Self {
+        Self {
+            tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+            full_scan_queued: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn queued(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
+    }
+
+    fn send(&self, cmd: IndexCommand) {
+        if matches!(cmd, IndexCommand::FullScan)
+            && self.full_scan_queued.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(cmd).is_err() {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn complete(&self, cmd: &IndexCommand) {
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        if matches!(cmd, IndexCommand::FullScan) {
+            self.full_scan_queued.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Indexer {
@@ -135,8 +176,9 @@ impl Indexer {
         let worker_status = status.clone();
         let worker_error_status = status.clone();
         let (tx, rx) = mpsc::channel();
+        let queue = IndexQueue::new(tx);
         let watch_path = serve_path.clone();
-        let worker_tx = tx.clone();
+        let worker_queue = queue.clone();
         let worker_running = running.clone();
         thread::spawn(move || {
             if let Err(err) = run_worker(
@@ -148,6 +190,7 @@ impl Indexer {
                 follow_symlinks,
                 load,
                 snapshot_interval,
+                worker_queue,
                 worker_status,
                 worker_running,
             ) {
@@ -160,16 +203,16 @@ impl Indexer {
             }
         });
         let indexer = Self {
-            tx,
+            queue,
             snapshot_path,
             status,
         };
         indexer.full_scan();
         if watch {
-            indexer.start_watcher(watch_path, worker_tx.clone(), running.clone());
+            indexer.start_watcher(watch_path, indexer.queue.clone(), running.clone());
         }
         if scan_interval > 0 {
-            start_periodic_scan(worker_tx, scan_interval, running);
+            start_periodic_scan(indexer.queue.clone(), scan_interval, running);
         }
         Ok(indexer)
     }
@@ -189,34 +232,35 @@ impl Indexer {
     pub fn status(&self) -> IndexStatus {
         self.status
             .lock()
-            .map(|status| status.clone())
+            .map(|status| {
+                let mut status = status.clone();
+                status.queued_commands = self.queue.queued();
+                status
+            })
             .unwrap_or_default()
     }
 
     pub fn full_scan(&self) {
-        let _ = self.tx.send(IndexCommand::FullScan);
+        self.queue.send(IndexCommand::FullScan);
     }
 
     pub fn scan_path<P: AsRef<Path>>(&self, path: P) {
-        let _ = self
-            .tx
+        self.queue
             .send(IndexCommand::ScanPath(path.as_ref().to_path_buf()));
     }
 
     pub fn upsert_path<P: AsRef<Path>>(&self, path: P) {
-        let _ = self
-            .tx
+        self.queue
             .send(IndexCommand::UpsertPath(path.as_ref().to_path_buf()));
     }
 
     pub fn remove_path<P: AsRef<Path>>(&self, path: P) {
-        let _ = self
-            .tx
+        self.queue
             .send(IndexCommand::RemovePath(path.as_ref().to_path_buf()));
     }
 
     pub fn move_path<P: AsRef<Path>>(&self, from: P, to: P) {
-        let _ = self.tx.send(IndexCommand::MovePath {
+        self.queue.send(IndexCommand::MovePath {
             from: from.as_ref().to_path_buf(),
             to: to.as_ref().to_path_buf(),
         });
@@ -230,22 +274,17 @@ impl Indexer {
         access_paths: Vec<String>,
     ) -> Result<Vec<PathItem>> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(IndexCommand::Search {
+        self.queue.send(IndexCommand::Search {
             base: base.as_ref().to_path_buf(),
             q,
             limit,
             access_paths,
             reply,
-        })?;
+        });
         rx.await?
     }
 
-    fn start_watcher(
-        &self,
-        watch_path: PathBuf,
-        tx: mpsc::Sender<IndexCommand>,
-        running: Arc<AtomicBool>,
-    ) {
+    fn start_watcher(&self, watch_path: PathBuf, queue: IndexQueue, running: Arc<AtomicBool>) {
         thread::spawn(move || {
             let (event_tx, event_rx) = mpsc::channel();
             let mut watcher = match RecommendedWatcher::new(
@@ -271,25 +310,23 @@ impl Indexer {
             while running.load(Ordering::SeqCst) {
                 match event_rx.recv_timeout(INDEX_WATCH_DEBOUNCE) {
                     Ok(event) => collect_notify_event(&mut pending, event),
-                    Err(mpsc::RecvTimeoutError::Timeout) => flush_watch_events(&tx, &mut pending),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        flush_watch_events(&queue, &mut pending)
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-            flush_watch_events(&tx, &mut pending);
+            flush_watch_events(&queue, &mut pending);
         });
     }
 }
 
-fn start_periodic_scan(
-    tx: mpsc::Sender<IndexCommand>,
-    scan_interval: u64,
-    running: Arc<AtomicBool>,
-) {
+fn start_periodic_scan(queue: IndexQueue, scan_interval: u64, running: Arc<AtomicBool>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(scan_interval));
         while running.load(Ordering::SeqCst) {
             interval.tick().await;
-            let _ = tx.send(IndexCommand::FullScan);
+            queue.send(IndexCommand::FullScan);
         }
     });
 }
@@ -303,6 +340,7 @@ fn run_worker(
     follow_symlinks: bool,
     load: Arc<ServerLoad>,
     snapshot_interval: u64,
+    queue: IndexQueue,
     status: Arc<Mutex<IndexStatus>>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -346,6 +384,10 @@ fn run_worker(
             }
             continue;
         };
+        queue.complete(&cmd);
+        update_status(&status, |status| {
+            status.queued_commands = queue.queued();
+        });
         match cmd {
             IndexCommand::FullScan => {
                 let start = Instant::now();
@@ -354,7 +396,16 @@ fn run_worker(
                     status.last_error = None;
                 });
                 let scan = db.full_scan_with_yield(|db| {
-                    drain_scan_commands(db, &rx, &mut snapshot_dirty, &mut snapshot_dirty_at);
+                    drain_scan_commands(
+                        db,
+                        &rx,
+                        &queue,
+                        &mut snapshot_dirty,
+                        &mut snapshot_dirty_at,
+                    );
+                    update_status(&status, |status| {
+                        status.queued_commands = queue.queued();
+                    });
                 });
                 if let Err(err) = scan {
                     update_status(&status, |status| {
@@ -441,10 +492,12 @@ fn update_status(status: &Arc<Mutex<IndexStatus>>, update: impl FnOnce(&mut Inde
 fn drain_scan_commands(
     db: &mut IndexDb,
     rx: &mpsc::Receiver<IndexCommand>,
+    queue: &IndexQueue,
     snapshot_dirty: &mut bool,
     snapshot_dirty_at: &mut Instant,
 ) {
     while let Ok(cmd) = rx.try_recv() {
+        queue.complete(&cmd);
         match cmd {
             IndexCommand::FullScan => {
                 // Coalesce full scans requested while one is already in progress.
@@ -823,16 +876,13 @@ fn collect_notify_event(pending: &mut HashMap<PathBuf, WatchAction>, event: noti
     }
 }
 
-fn flush_watch_events(
-    tx: &mpsc::Sender<IndexCommand>,
-    pending: &mut HashMap<PathBuf, WatchAction>,
-) {
+fn flush_watch_events(queue: &IndexQueue, pending: &mut HashMap<PathBuf, WatchAction>) {
     for (path, action) in pending.drain() {
         let cmd = match action {
             WatchAction::Scan => IndexCommand::ScanPath(path),
             WatchAction::Remove => IndexCommand::RemovePath(path),
         };
-        let _ = tx.send(cmd);
+        queue.send(cmd);
     }
 }
 

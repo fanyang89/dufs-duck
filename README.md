@@ -400,7 +400,7 @@ Check index status:
 curl http://127.0.0.1:5000/__dufs__/index/status
 ```
 
-The response includes whether indexing is ready, whether a scan is running, indexed file count, schema version, watcher settings, snapshot settings, last scan/snapshot timings, and the last indexer error if any.
+The response includes whether indexing is ready, whether a scan is running, indexed file count, queued command count, schema version, watcher settings, snapshot settings, last scan/snapshot timings, and the last indexer error if any.
 
 ## Environment variables
 
