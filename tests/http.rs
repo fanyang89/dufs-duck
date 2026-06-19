@@ -158,27 +158,25 @@ fn indexed_search_updates_after_write(
 }
 
 #[rstest]
-fn indexed_sql_query(
-    #[with(&[
-        "-A",
-        "--enable-index",
-        "--allow-query",
-        "--index-scan-interval",
-        "0"
-    ])]
+fn indexed_remote_db(
+    #[with(&["-A", "--enable-index", "--index-remote", "--index-scan-interval", "0"])]
     server: TestServer,
 ) -> Result<(), Error> {
-    let url = format!("{}__dufs__/query", server.url());
-    let text = wait_text_contains(
-        || {
-            reqwest::blocking::Client::new()
-                .post(&url)
-                .body("SELECT path FROM files WHERE path = 'test.html'")
-                .send()
-        },
-        "test.html",
-    )?;
-    assert!(text.contains("path"));
+    let resp = wait_response_ok(|| {
+        reqwest::blocking::get(format!("{}__dufs__/index.duckdb", server.url()))
+    })?;
+    let bytes = resp.bytes()?;
+    assert!(bytes.len() > 16);
+    assert_eq!(&bytes[8..12], b"DUCK");
+    Ok(())
+}
+
+#[rstest]
+fn indexed_remote_db_forbidden(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = reqwest::blocking::get(format!("{}__dufs__/index.duckdb", server.url()))?;
+    assert_eq!(resp.status(), 403);
     Ok(())
 }
 
@@ -497,6 +495,21 @@ where
         let text = resp.text()?;
         if !text.contains(needle) || start.elapsed() > Duration::from_secs(5) {
             return Ok(text);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_response_ok<F>(mut fetch: F) -> Result<reqwest::blocking::Response, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        if resp.status() == 200 || start.elapsed() > Duration::from_secs(5) {
+            assert_eq!(resp.status(), 200);
+            return Ok(resp);
         }
         sleep(Duration::from_millis(100));
     }

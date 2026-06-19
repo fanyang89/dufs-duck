@@ -61,7 +61,7 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
-const QUERY_PATH: &str = "__dufs__/query";
+const INDEX_DB_PATH: &str = "__dufs__/index.duckdb";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 pub struct Server {
@@ -259,12 +259,12 @@ impl Server {
             return Ok(res);
         }
 
-        if relative_path == QUERY_PATH {
-            self.handle_query(req, access_paths, &mut res).await?;
+        let head_only = method == Method::HEAD;
+
+        if relative_path == INDEX_DB_PATH {
+            self.handle_index_db(headers, head_only, &mut res).await?;
             return Ok(res);
         }
-
-        let head_only = method == Method::HEAD;
 
         if self.args.path_is_file {
             if self
@@ -749,13 +749,13 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_query(
+    async fn handle_index_db(
         &self,
-        req: Request,
-        access_paths: AccessPaths,
+        headers: &HeaderMap<HeaderValue>,
+        head_only: bool,
         res: &mut Response,
     ) -> Result<()> {
-        if !self.args.allow_query {
+        if !self.args.index_remote {
             status_forbid(res);
             return Ok(());
         }
@@ -763,40 +763,13 @@ impl Server {
             status_not_found(res);
             return Ok(());
         };
-        if req.method() != Method::POST {
-            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        let snapshot_path = indexer.readonly_snapshot_path();
+        if !snapshot_path.exists() {
+            *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             return Ok(());
         }
-        let body = req.collect().await?.to_bytes();
-        let mut sql = String::from_utf8(body.to_vec()).map_err(|_| anyhow!("Invalid UTF-8 SQL"))?;
-        if sql.trim_start().starts_with('{') {
-            let value: serde_json::Value = serde_json::from_str(&sql)?;
-            sql = value
-                .get("sql")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("Missing sql"))?
-                .to_string();
-        }
-        let path_filters = access_paths
-            .entry_paths(&self.args.serve_path)
-            .into_iter()
-            .filter_map(|path| {
-                path.strip_prefix(&self.args.serve_path)
-                    .ok()
-                    .map(normalize_path)
-            })
-            .collect::<Vec<_>>();
-        match indexer.query(sql, MAX_SUBPATHS_COUNT, path_filters).await {
-            Ok(output) => {
-                let output = serde_json::to_string_pretty(&output)?;
-                res.headers_mut()
-                    .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-                res.headers_mut()
-                    .typed_insert(ContentLength(output.len() as u64));
-                *res.body_mut() = body_full(output);
-            }
-            Err(err) => status_bad_request(res, &err.to_string()),
-        }
+        self.handle_send_file(snapshot_path, headers, head_only, res)
+            .await?;
         Ok(())
     }
 

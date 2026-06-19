@@ -1,12 +1,10 @@
 use crate::server::{PathItem, PathType};
 use crate::utils::get_file_name;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use duckdb::{params, Connection};
 use ignore::WalkBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Serialize;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -62,12 +60,7 @@ impl ServerLoad {
 #[derive(Clone)]
 pub struct Indexer {
     tx: mpsc::Sender<IndexCommand>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
+    snapshot_path: PathBuf,
 }
 
 enum IndexCommand {
@@ -85,12 +78,6 @@ enum IndexCommand {
         limit: u64,
         reply: oneshot::Sender<Result<Vec<PathItem>>>,
     },
-    Query {
-        sql: String,
-        limit: u64,
-        path_filters: Vec<String>,
-        reply: oneshot::Sender<Result<QueryResult>>,
-    },
 }
 
 impl Indexer {
@@ -107,6 +94,8 @@ impl Indexer {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let snapshot_path = Self::snapshot_path(&db_path);
+        let worker_snapshot_path = snapshot_path.clone();
         let (tx, rx) = mpsc::channel();
         let watch_path = serve_path.clone();
         let worker_tx = tx.clone();
@@ -116,6 +105,7 @@ impl Indexer {
                 rx,
                 serve_path.clone(),
                 db_path,
+                worker_snapshot_path,
                 hidden,
                 follow_symlinks,
                 load,
@@ -124,7 +114,7 @@ impl Indexer {
                 error!("indexer stopped: {err}");
             }
         });
-        let indexer = Self { tx };
+        let indexer = Self { tx, snapshot_path };
         indexer.full_scan();
         if watch {
             indexer.start_watcher(watch_path, worker_tx.clone(), running.clone());
@@ -137,6 +127,14 @@ impl Indexer {
 
     pub fn default_db_path(serve_path: &Path) -> PathBuf {
         serve_path.join(".dufs").join("index.duckdb")
+    }
+
+    pub fn snapshot_path(db_path: &Path) -> PathBuf {
+        db_path.with_file_name("index.readonly.duckdb")
+    }
+
+    pub fn readonly_snapshot_path(&self) -> &Path {
+        &self.snapshot_path
     }
 
     pub fn full_scan(&self) {
@@ -179,22 +177,6 @@ impl Indexer {
             base: base.as_ref().to_path_buf(),
             q,
             limit,
-            reply,
-        })?;
-        rx.await?
-    }
-
-    pub async fn query(
-        &self,
-        sql: String,
-        limit: u64,
-        path_filters: Vec<String>,
-    ) -> Result<QueryResult> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(IndexCommand::Query {
-            sql,
-            limit,
-            path_filters,
             reply,
         })?;
         rx.await?
@@ -250,12 +232,20 @@ fn run_worker(
     rx: mpsc::Receiver<IndexCommand>,
     serve_path: PathBuf,
     db_path: PathBuf,
+    snapshot_path: PathBuf,
     hidden: Vec<String>,
     follow_symlinks: bool,
     load: Arc<ServerLoad>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut db = IndexDb::new(serve_path, db_path, hidden, follow_symlinks, load)?;
+    let mut db = IndexDb::new(
+        serve_path,
+        db_path,
+        snapshot_path,
+        hidden,
+        follow_symlinks,
+        load,
+    )?;
     while running.load(Ordering::SeqCst) {
         let Ok(cmd) = rx.recv_timeout(Duration::from_secs(1)) else {
             continue;
@@ -267,22 +257,26 @@ fn run_worker(
                 }
             }
             IndexCommand::ScanPath(path) => {
-                if let Err(err) = db.scan_path(&path) {
+                if let Err(err) = db.scan_path(&path).and_then(|_| db.refresh_snapshot()) {
                     warn!("failed to scan {}: {err}", path.display());
                 }
             }
             IndexCommand::UpsertPath(path) => {
-                if let Err(err) = db.upsert_path(&path) {
+                if let Err(err) = db.upsert_path(&path).and_then(|_| db.refresh_snapshot()) {
                     warn!("failed to index {}: {err}", path.display());
                 }
             }
             IndexCommand::RemovePath(path) => {
-                if let Err(err) = db.remove_path(&path) {
+                if let Err(err) = db.remove_path(&path).and_then(|_| db.refresh_snapshot()) {
                     warn!("failed to remove {} from index: {err}", path.display());
                 }
             }
             IndexCommand::MovePath { from, to } => {
-                if let Err(err) = db.remove_path(&from).and_then(|_| db.scan_path(&to)) {
+                if let Err(err) = db
+                    .remove_path(&from)
+                    .and_then(|_| db.scan_path(&to))
+                    .and_then(|_| db.refresh_snapshot())
+                {
                     warn!(
                         "failed to move index entry {} -> {}: {err}",
                         from.display(),
@@ -298,14 +292,6 @@ fn run_worker(
             } => {
                 let _ = reply.send(db.search(&base, &q, limit));
             }
-            IndexCommand::Query {
-                sql,
-                limit,
-                path_filters,
-                reply,
-            } => {
-                let _ = reply.send(db.query(&sql, limit, &path_filters));
-            }
         }
     }
     Ok(())
@@ -313,6 +299,8 @@ fn run_worker(
 
 struct IndexDb {
     conn: Connection,
+    db_path: PathBuf,
+    snapshot_path: PathBuf,
     serve_path: PathBuf,
     hidden: Vec<String>,
     follow_symlinks: bool,
@@ -371,11 +359,12 @@ impl IndexDb {
     fn new(
         serve_path: PathBuf,
         db_path: PathBuf,
+        snapshot_path: PathBuf,
         hidden: Vec<String>,
         follow_symlinks: bool,
         load: Arc<ServerLoad>,
     ) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
@@ -403,6 +392,8 @@ impl IndexDb {
         )?;
         Ok(Self {
             conn,
+            db_path,
+            snapshot_path,
             serve_path,
             hidden,
             follow_symlinks,
@@ -419,6 +410,7 @@ impl IndexDb {
             "DELETE FROM files WHERE scan_generation <> ?",
             params![generation],
         )?;
+        self.refresh_snapshot()?;
         Ok(())
     }
 
@@ -522,6 +514,17 @@ impl IndexDb {
         Ok(())
     }
 
+    fn refresh_snapshot(&mut self) -> Result<()> {
+        self.conn.execute_batch("CHECKPOINT")?;
+        if let Some(parent) = self.snapshot_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = self.snapshot_path.with_extension("duckdb.tmp");
+        std::fs::copy(&self.db_path, &tmp_path)?;
+        std::fs::rename(tmp_path, &self.snapshot_path)?;
+        Ok(())
+    }
+
     fn search(&self, base: &Path, q: &str, limit: u64) -> Result<Vec<PathItem>> {
         let base_rel = normalize_path(base.strip_prefix(&self.serve_path)?);
         let path_like = if base_rel.is_empty() {
@@ -557,48 +560,6 @@ impl IndexDb {
         })?;
         rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
     }
-
-    fn query(&self, sql: &str, limit: u64, path_filters: &[String]) -> Result<QueryResult> {
-        ensure_select(sql)?;
-        let filter = if path_filters.is_empty() {
-            "true".to_string()
-        } else {
-            path_filters
-                .iter()
-                .map(|path| {
-                    if path.is_empty() {
-                        "true".to_string()
-                    } else {
-                        let escaped = path.replace('\'', "''");
-                        format!("path = '{escaped}' OR path LIKE '{escaped}/%'")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        };
-        let wrapped = format!("SELECT * FROM ({sql}) AS dufs_query WHERE {filter} LIMIT {limit}");
-        let mut stmt = self.conn.prepare(&wrapped)?;
-        let mut rows = stmt.query([])?;
-        let stmt = rows
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Invalid query"))?;
-        let column_count = stmt.column_count();
-        let columns = (0..column_count)
-            .map(|i| stmt.column_name(i).map(|v| v.to_string()))
-            .collect::<duckdb::Result<Vec<_>>>()?;
-        let mut output = vec![];
-        while let Some(row) = rows.next()? {
-            let mut values = vec![];
-            for i in 0..column_count {
-                values.push(Value::String(format!("{:?}", row.get_ref(i)?)));
-            }
-            output.push(values);
-        }
-        Ok(QueryResult {
-            columns,
-            rows: output,
-        })
-    }
 }
 
 fn handle_notify_event(tx: &mpsc::Sender<IndexCommand>, event: notify::Event) {
@@ -615,29 +576,6 @@ fn handle_notify_event(tx: &mpsc::Sender<IndexCommand>, event: notify::Event) {
             let _ = tx.send(IndexCommand::ScanPath(path));
         }
     }
-}
-
-fn ensure_select(sql: &str) -> Result<()> {
-    let sql = sql.trim();
-    if sql.contains(';') {
-        bail!("Only a single SELECT statement is allowed");
-    }
-    let lower = sql.to_lowercase();
-    if !lower.starts_with("select") && !lower.starts_with("with") {
-        bail!("Only SELECT statements are allowed");
-    }
-    for word in [
-        "insert", "update", "delete", "copy", "attach", "install", "load", "pragma", "create",
-        "drop", "alter",
-    ] {
-        if lower
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .any(|v| v == word)
-        {
-            bail!("Only SELECT statements are allowed");
-        }
-    }
-    Ok(())
 }
 
 fn parse_path_type(value: &str) -> PathType {

@@ -157,14 +157,6 @@ pub fn build_cli() -> Command {
                 .help("Allow ?hash query to get file sha256 hash"),
         )
         .arg(
-            Arg::new("allow-query")
-                .env("DUFS_ALLOW_QUERY")
-                .hide_env(true)
-                .long("allow-query")
-                .action(ArgAction::SetTrue)
-                .help("Allow SQL SELECT queries against the file index"),
-        )
-        .arg(
             Arg::new("enable-index")
                 .env("DUFS_ENABLE_INDEX")
                 .hide_env(true)
@@ -180,6 +172,14 @@ pub fn build_cli() -> Command {
                 .value_parser(value_parser!(PathBuf))
                 .help("Path to the DuckDB index database")
                 .value_name("file"),
+        )
+        .arg(
+            Arg::new("index-remote")
+                .env("DUFS_INDEX_REMOTE")
+                .hide_env(true)
+                .long("index-remote")
+                .action(ArgAction::SetTrue)
+                .help("Expose a read-only DuckDB index snapshot over HTTP"),
         )
         .arg(
             Arg::new("index-watch")
@@ -341,9 +341,9 @@ pub struct Args {
     pub allow_symlink: bool,
     pub allow_archive: bool,
     pub allow_hash: bool,
-    pub allow_query: bool,
     pub enable_index: bool,
     pub index_db: Option<PathBuf>,
+    pub index_remote: bool,
     #[serde(default = "default_index_watch")]
     #[default(default_index_watch())]
     pub index_watch: bool,
@@ -448,11 +448,11 @@ impl Args {
         if !args.allow_hash {
             args.allow_hash = allow_all || matches.get_flag("allow-hash");
         }
-        if !args.allow_query {
-            args.allow_query = allow_all || matches.get_flag("allow-query");
-        }
         if !args.enable_index {
             args.enable_index = matches.get_flag("enable-index");
+        }
+        if !args.index_remote {
+            args.index_remote = matches.get_flag("index-remote");
         }
         if let Some(index_db) = matches.get_one::<PathBuf>("index-db") {
             args.index_db = Some(index_db.clone());
