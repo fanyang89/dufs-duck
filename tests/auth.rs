@@ -6,6 +6,8 @@ use digest_auth_util::send_with_digest_auth;
 use fixtures::{server, Error, TestServer};
 use indexmap::IndexSet;
 use rstest::rstest;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 #[rstest]
 fn no_auth(#[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer) -> Result<(), Error> {
@@ -299,6 +301,37 @@ fn auth_path_prefix(
     Ok(())
 }
 
+fn wait_text_contains<F>(mut fetch: F, needle: &str) -> Result<String, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        assert_eq!(resp.status(), 200);
+        let text = resp.text()?;
+        if text.contains(needle) || start.elapsed() > Duration::from_secs(5) {
+            return Ok(text);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_response_ok<F>(mut fetch: F) -> Result<reqwest::blocking::Response, Error>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let start = Instant::now();
+    loop {
+        let resp = fetch()?;
+        if resp.status() == 200 || start.elapsed() > Duration::from_secs(5) {
+            assert_eq!(resp.status(), 200);
+            return Ok(resp);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
 #[rstest]
 fn auth_partial_index(
     #[with(&["--auth", "user:pass@/dir1:rw,/dir2:rw", "-A"])] server: TestServer,
@@ -318,6 +351,64 @@ fn auth_partial_index(
         paths,
         IndexSet::from(["dir1/test.html".into(), "dir2/test.html".into()])
     );
+    Ok(())
+}
+
+#[rstest]
+fn auth_indexed_search_filters_paths(
+    #[with(&[
+        "--auth",
+        "user:pass@/dir1:rw",
+        "-A",
+        "--enable-index",
+        "--index-scan-interval",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let text = wait_text_contains(
+        || {
+            reqwest::blocking::Client::new()
+                .get(format!("{}?q=test.html&simple", server.url()))
+                .basic_auth("user", Some("pass"))
+                .send()
+        },
+        "dir1/test.html",
+    )?;
+    assert!(text.contains("dir1/test.html"));
+    assert!(!text.lines().any(|line| line == "test.html"));
+    Ok(())
+}
+
+#[rstest]
+fn auth_index_remote_requires_full_access(
+    #[with(&[
+        "--auth",
+        "admin:admin@/:rw",
+        "--auth",
+        "user:pass@/dir1:rw",
+        "-A",
+        "--enable-index",
+        "--index-remote",
+        "--index-scan-interval",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}__dufs__/index.duckdb", server.url());
+    let resp = reqwest::blocking::Client::new()
+        .get(&url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+
+    let resp = wait_response_ok(|| {
+        reqwest::blocking::Client::new()
+            .get(&url)
+            .basic_auth("admin", Some("admin"))
+            .send()
+    })?;
+    assert_eq!(resp.status(), 200);
     Ok(())
 }
 

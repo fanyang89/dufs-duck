@@ -76,6 +76,7 @@ enum IndexCommand {
         base: PathBuf,
         q: String,
         limit: u64,
+        access_paths: Vec<String>,
         reply: oneshot::Sender<Result<Vec<PathItem>>>,
     },
 }
@@ -171,12 +172,14 @@ impl Indexer {
         base: P,
         q: String,
         limit: u64,
+        access_paths: Vec<String>,
     ) -> Result<Vec<PathItem>> {
         let (reply, rx) = oneshot::channel();
         self.tx.send(IndexCommand::Search {
             base: base.as_ref().to_path_buf(),
             q,
             limit,
+            access_paths,
             reply,
         })?;
         rx.await?
@@ -288,9 +291,10 @@ fn run_worker(
                 base,
                 q,
                 limit,
+                access_paths,
                 reply,
             } => {
-                let _ = reply.send(db.search(&base, &q, limit));
+                let _ = reply.send(db.search(&base, &q, limit, &access_paths));
             }
         }
     }
@@ -525,7 +529,13 @@ impl IndexDb {
         Ok(())
     }
 
-    fn search(&self, base: &Path, q: &str, limit: u64) -> Result<Vec<PathItem>> {
+    fn search(
+        &self,
+        base: &Path,
+        q: &str,
+        limit: u64,
+        access_paths: &[String],
+    ) -> Result<Vec<PathItem>> {
         let base_rel = normalize_path(base.strip_prefix(&self.serve_path)?);
         let path_like = if base_rel.is_empty() {
             "%".to_string()
@@ -533,12 +543,14 @@ impl IndexDb {
             format!("{base_rel}/%")
         };
         let q_like = format!("%{}%", q.to_lowercase());
-        let mut stmt = self.conn.prepare(
+        let access_filter = build_access_filter(access_paths);
+        let sql = format!(
             "SELECT path, path_type, size, mtime FROM files
-             WHERE path LIKE ? AND (lower(name) LIKE ? OR lower(path) LIKE ?)
+             WHERE path LIKE ? AND (lower(name) LIKE ? OR lower(path) LIKE ?) AND ({access_filter})
              ORDER BY CASE WHEN path_type IN ('Dir', 'SymlinkDir') THEN 0 ELSE 1 END, lower(path)
-             LIMIT ?",
-        )?;
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![path_like, q_like, q_like, limit], |row| {
             let path: String = row.get(0)?;
             let path_type: String = row.get(1)?;
@@ -576,6 +588,23 @@ fn handle_notify_event(tx: &mpsc::Sender<IndexCommand>, event: notify::Event) {
             let _ = tx.send(IndexCommand::ScanPath(path));
         }
     }
+}
+
+fn build_access_filter(access_paths: &[String]) -> String {
+    if access_paths.iter().any(|path| path.is_empty()) {
+        return "true".to_string();
+    }
+    if access_paths.is_empty() {
+        return "false".to_string();
+    }
+    access_paths
+        .iter()
+        .map(|path| {
+            let escaped = path.replace('\'', "''");
+            format!("path = '{escaped}' OR path LIKE '{escaped}/%'")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn parse_path_type(value: &str) -> PathType {

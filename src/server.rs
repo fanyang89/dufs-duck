@@ -262,7 +262,8 @@ impl Server {
         let head_only = method == Method::HEAD;
 
         if relative_path == INDEX_DB_PATH {
-            self.handle_index_db(headers, head_only, &mut res).await?;
+            self.handle_index_db(headers, head_only, access_paths, &mut res)
+                .await?;
             return Ok(res);
         }
 
@@ -660,7 +661,12 @@ impl Server {
         if !head_only {
             if let Some(indexer) = &self.indexer {
                 paths = indexer
-                    .search(path, search.clone(), MAX_SUBPATHS_COUNT)
+                    .search(
+                        path,
+                        search.clone(),
+                        MAX_SUBPATHS_COUNT,
+                        access_path_filters(&self.args.serve_path, &access_paths),
+                    )
                     .await?;
             } else {
                 let path_buf = path.to_path_buf();
@@ -753,9 +759,14 @@ impl Server {
         &self,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
+        access_paths: AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
         if !self.args.index_remote {
+            status_forbid(res);
+            return Ok(());
+        }
+        if !has_full_root_access(&self.args.serve_path, &access_paths) {
             status_forbid(res);
             return Ok(());
         }
@@ -1947,6 +1958,20 @@ fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
 
 pub(crate) fn is_hidden_path(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
     is_hidden(hidden, file_name, is_dir)
+}
+
+fn access_path_filters(serve_path: &Path, access_paths: &AccessPaths) -> Vec<String> {
+    access_paths
+        .entry_paths(serve_path)
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(serve_path).ok().map(normalize_path))
+        .collect()
+}
+
+fn has_full_root_access(serve_path: &Path, access_paths: &AccessPaths) -> bool {
+    access_path_filters(serve_path, access_paths)
+        .iter()
+        .any(|path| path.is_empty())
 }
 
 fn set_webdav_headers(res: &mut Response) {
