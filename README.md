@@ -75,6 +75,8 @@ Options:
       --no-index-watch       Disable file system watching for the index
       --index-scan-interval <seconds>
                              Periodic index scan interval in seconds, 0 disables it
+      --index-snapshot-interval <seconds>
+                             Index snapshot refresh interval in seconds, 0 disables incremental snapshots
       --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
       --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
       --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
@@ -363,6 +365,7 @@ When indexing is enabled:
 - Search requests such as `?q=report` use the DuckDB index.
 - The file system watcher updates the index for external changes by default.
 - A periodic scan runs every 300 seconds by default; set `--index-scan-interval 0` to disable it.
+- Remote DuckDB snapshots refresh every 5 seconds after incremental changes by default; set `--index-snapshot-interval 0` to disable incremental snapshot refreshes.
 - The index respects dufs access permissions for search results.
 - The index only stores file metadata such as path, name, type, size, and mtime. It does not index file contents.
 - The index traversal uses ignore rules such as `.gitignore` and `.ignore`.
@@ -397,7 +400,7 @@ Check index status:
 curl http://127.0.0.1:5000/__dufs__/index/status
 ```
 
-The response includes whether indexing is ready, whether a scan is running, indexed file count, schema version, last scan time, last snapshot time, and the last indexer error if any.
+The response includes whether indexing is ready, whether a scan is running, indexed file count, schema version, watcher settings, snapshot settings, last scan/snapshot timings, and the last indexer error if any.
 
 ## Environment variables
 
@@ -424,6 +427,8 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --index-watch           DUFS_INDEX_WATCH=true
     --no-index-watch        DUFS_NO_INDEX_WATCH=true
     --index-scan-interval   DUFS_INDEX_SCAN_INTERVAL=300
+    --index-snapshot-interval
+                            DUFS_INDEX_SNAPSHOT_INTERVAL=5
     --enable-cors           DUFS_ENABLE_CORS=true
     --render-index          DUFS_RENDER_INDEX=true
     --render-try-index      DUFS_RENDER_TRY_INDEX=true
@@ -467,6 +472,7 @@ index-db: ./.dufs/index.duckdb
 index-remote: true
 index-watch: true
 index-scan-interval: 300
+index-snapshot-interval: 5
 enable-cors: true
 render-index: true
 render-try-index: true

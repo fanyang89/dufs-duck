@@ -208,6 +208,15 @@ pub fn build_cli() -> Command {
                 .value_name("seconds"),
         )
         .arg(
+            Arg::new("index-snapshot-interval")
+                .env("DUFS_INDEX_SNAPSHOT_INTERVAL")
+                .hide_env(true)
+                .long("index-snapshot-interval")
+                .value_parser(value_parser!(u64))
+                .help("Index snapshot refresh interval in seconds, 0 disables incremental snapshots")
+                .value_name("seconds"),
+        )
+        .arg(
             Arg::new("enable-cors")
                 .env("DUFS_ENABLE_CORS")
 				.hide_env(true)
@@ -350,6 +359,9 @@ pub struct Args {
     #[serde(default = "default_index_scan_interval")]
     #[default(default_index_scan_interval())]
     pub index_scan_interval: u64,
+    #[serde(default = "default_index_snapshot_interval")]
+    #[default(default_index_snapshot_interval())]
+    pub index_snapshot_interval: u64,
     pub render_index: bool,
     pub render_spa: bool,
     pub render_try_index: bool,
@@ -464,6 +476,9 @@ impl Args {
         }
         if let Some(interval) = matches.get_one::<u64>("index-scan-interval") {
             args.index_scan_interval = *interval;
+        }
+        if let Some(interval) = matches.get_one::<u64>("index-snapshot-interval") {
+            args.index_snapshot_interval = *interval;
         }
         if !args.allow_archive {
             args.allow_archive = allow_all || matches.get_flag("allow-archive");
@@ -730,6 +745,10 @@ fn default_index_scan_interval() -> u64 {
     300
 }
 
+fn default_index_snapshot_interval() -> u64 {
+    5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,11 +788,20 @@ mod tests {
         let cli = build_cli();
         let matches = cli
             .try_get_matches_from(vec![
-                "", "--hidden", "tmp", "--hidden", "*.log", "--hidden", "*.lock",
+                "",
+                "--hidden",
+                "tmp",
+                "--hidden",
+                "*.log",
+                "--hidden",
+                "*.lock",
+                "--index-snapshot-interval",
+                "9",
             ])
             .unwrap();
         let args = Args::parse(matches).unwrap();
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
+        assert_eq!(args.index_snapshot_interval, 9);
     }
 
     #[test]
@@ -803,6 +831,7 @@ serve-path: {}
 bind: 0.0.0.0
 port: 3000
 allow-upload: true
+index-snapshot-interval: 7
 hidden: tmp,*.log,*.lock
 "#,
             tmpdir.display()
@@ -822,6 +851,7 @@ hidden: tmp,*.log,*.lock
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
         assert_eq!(args.port, 3000);
         assert!(args.allow_upload);
+        assert_eq!(args.index_snapshot_interval, 7);
     }
 
     #[test]

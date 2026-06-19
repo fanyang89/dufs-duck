@@ -17,7 +17,6 @@ use tokio::sync::oneshot;
 const INDEX_SCAN_BATCH_SIZE: usize = 128;
 const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
 const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
-const INDEX_SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(1);
 const INDEX_WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 const INDEX_SCHEMA_VERSION: u64 = 1;
 
@@ -81,8 +80,14 @@ pub struct IndexStatus {
     pub ready: bool,
     pub scanning: bool,
     pub indexed_count: u64,
+    pub snapshot_dirty: bool,
+    pub watch_enabled: bool,
+    pub scan_interval: u64,
+    pub snapshot_interval: u64,
     pub last_scan_at: Option<u64>,
     pub last_snapshot_at: Option<u64>,
+    pub last_scan_duration_ms: Option<u64>,
+    pub last_snapshot_duration_ms: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -112,6 +117,7 @@ impl Indexer {
         follow_symlinks: bool,
         watch: bool,
         scan_interval: u64,
+        snapshot_interval: u64,
         running: Arc<AtomicBool>,
         load: Arc<ServerLoad>,
     ) -> Result<Self> {
@@ -121,6 +127,11 @@ impl Indexer {
         let snapshot_path = Self::snapshot_path(&db_path);
         let worker_snapshot_path = snapshot_path.clone();
         let status = Arc::new(Mutex::new(IndexStatus::default()));
+        update_status(&status, |status| {
+            status.watch_enabled = watch;
+            status.scan_interval = scan_interval;
+            status.snapshot_interval = snapshot_interval;
+        });
         let worker_status = status.clone();
         let worker_error_status = status.clone();
         let (tx, rx) = mpsc::channel();
@@ -136,6 +147,7 @@ impl Indexer {
                 hidden,
                 follow_symlinks,
                 load,
+                snapshot_interval,
                 worker_status,
                 worker_running,
             ) {
@@ -290,6 +302,7 @@ fn run_worker(
     hidden: Vec<String>,
     follow_symlinks: bool,
     load: Arc<ServerLoad>,
+    snapshot_interval: u64,
     status: Arc<Mutex<IndexStatus>>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -308,7 +321,11 @@ fn run_worker(
     let mut snapshot_dirty_at = Instant::now();
     while running.load(Ordering::SeqCst) {
         let Ok(cmd) = rx.recv_timeout(Duration::from_millis(200)) else {
-            if snapshot_dirty && snapshot_dirty_at.elapsed() >= INDEX_SNAPSHOT_DEBOUNCE {
+            if snapshot_interval > 0
+                && snapshot_dirty
+                && snapshot_dirty_at.elapsed() >= Duration::from_secs(snapshot_interval)
+            {
+                let start = Instant::now();
                 if let Err(err) = db.refresh_snapshot() {
                     update_status(&status, |status| {
                         status.last_error = Some(err.to_string());
@@ -319,7 +336,9 @@ fn run_worker(
                     update_status(&status, |status| {
                         status.ready = true;
                         status.indexed_count = indexed_count;
+                        status.snapshot_dirty = false;
                         status.last_snapshot_at = Some(now_millis());
+                        status.last_snapshot_duration_ms = Some(duration_millis(start.elapsed()));
                         status.last_error = None;
                     });
                     snapshot_dirty = false;
@@ -329,6 +348,7 @@ fn run_worker(
         };
         match cmd {
             IndexCommand::FullScan => {
+                let start = Instant::now();
                 update_status(&status, |status| {
                     status.scanning = true;
                     status.last_error = None;
@@ -348,8 +368,11 @@ fn run_worker(
                         status.ready = true;
                         status.scanning = false;
                         status.indexed_count = indexed_count;
+                        status.snapshot_dirty = false;
                         status.last_scan_at = Some(now_millis());
                         status.last_snapshot_at = Some(now_millis());
+                        status.last_scan_duration_ms = Some(duration_millis(start.elapsed()));
+                        status.last_snapshot_duration_ms = None;
                         status.last_error = None;
                     });
                     snapshot_dirty = false;
@@ -361,6 +384,7 @@ fn run_worker(
                 } else {
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
+                    update_status(&status, |status| status.snapshot_dirty = true);
                 }
             }
             IndexCommand::UpsertPath(path) => {
@@ -369,6 +393,7 @@ fn run_worker(
                 } else {
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
+                    update_status(&status, |status| status.snapshot_dirty = true);
                 }
             }
             IndexCommand::RemovePath(path) => {
@@ -377,6 +402,7 @@ fn run_worker(
                 } else {
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
+                    update_status(&status, |status| status.snapshot_dirty = true);
                 }
             }
             IndexCommand::MovePath { from, to } => {
@@ -389,6 +415,7 @@ fn run_worker(
                 } else {
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
+                    update_status(&status, |status| status.snapshot_dirty = true);
                 }
             }
             IndexCommand::Search {
@@ -864,4 +891,8 @@ fn to_timestamp(time: SystemTime) -> u64 {
 
 fn now_millis() -> u64 {
     to_timestamp(SystemTime::now())
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }

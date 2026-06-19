@@ -1,6 +1,7 @@
 mod fixtures;
 mod utils;
 
+use duckdb::Connection;
 use fixtures::{server, Error, TestServer, BIN_FILE};
 use rstest::rstest;
 use serde_json::Value;
@@ -285,6 +286,10 @@ fn index_status_disabled(server: TestServer) -> Result<(), Error> {
     assert_eq!(value["enabled"], false);
     assert_eq!(value["schema_version"], 0);
     assert_eq!(value["ready"], false);
+    assert_eq!(value["snapshot_dirty"], false);
+    assert_eq!(value["watch_enabled"], false);
+    assert_eq!(value["scan_interval"], 0);
+    assert_eq!(value["snapshot_interval"], 0);
     Ok(())
 }
 
@@ -300,9 +305,39 @@ fn index_status_ready(
     assert_eq!(value["enabled"], true);
     assert_eq!(value["remote"], true);
     assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["watch_enabled"], true);
+    assert_eq!(value["scan_interval"], 0);
+    assert_eq!(value["snapshot_interval"], 5);
+    assert_eq!(value["snapshot_dirty"], false);
     assert!(value["indexed_count"].as_u64().unwrap_or_default() > 0);
     assert!(value["last_scan_at"].as_u64().is_some());
     assert!(value["last_snapshot_at"].as_u64().is_some());
+    assert!(value["last_scan_duration_ms"].as_u64().is_some());
+    Ok(())
+}
+
+#[rstest]
+fn index_snapshot_interval_refreshes_remote_snapshot(
+    #[with(&[
+        "-A",
+        "--enable-index",
+        "--index-remote",
+        "--index-scan-interval",
+        "0",
+        "--index-snapshot-interval",
+        "1"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    wait_response_ok(|| reqwest::blocking::get(format!("{}__dufs__/index.duckdb", server.url())))?;
+    let url = format!("{}snapshot-interval.txt", server.url());
+    let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 201);
+
+    wait_snapshot_contains(
+        server.path().join(".dufs/index.readonly.duckdb"),
+        "snapshot-interval.txt",
+    )?;
     Ok(())
 }
 
@@ -653,6 +688,30 @@ where
         let value: Value = serde_json::from_str(&resp.text()?)?;
         if predicate(&value) || start.elapsed() > Duration::from_secs(5) {
             return Ok(value);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_snapshot_contains(path: std::path::PathBuf, indexed_path: &str) -> Result<(), Error> {
+    let start = Instant::now();
+    loop {
+        if path.exists() {
+            if let Ok(conn) = Connection::open(&path) {
+                let count: u64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM files WHERE path = ?",
+                        [indexed_path],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_default();
+                if count > 0 {
+                    return Ok(());
+                }
+            }
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            return Err(format!("snapshot did not contain {indexed_path}").into());
         }
         sleep(Duration::from_millis(100));
     }

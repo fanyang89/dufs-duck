@@ -108,6 +108,7 @@ impl Server {
                 args.allow_symlink,
                 args.index_watch,
                 args.index_scan_interval,
+                args.index_snapshot_interval,
                 running.clone(),
                 load.clone(),
             )?)
@@ -821,8 +822,14 @@ impl Server {
                 "ready": status.ready,
                 "scanning": status.scanning,
                 "indexed_count": status.indexed_count,
+                "snapshot_dirty": status.snapshot_dirty,
+                "watch_enabled": status.watch_enabled,
+                "scan_interval": status.scan_interval,
+                "snapshot_interval": status.snapshot_interval,
                 "last_scan_at": status.last_scan_at,
                 "last_snapshot_at": status.last_snapshot_at,
+                "last_scan_duration_ms": status.last_scan_duration_ms,
+                "last_snapshot_duration_ms": status.last_snapshot_duration_ms,
                 "last_error": status.last_error,
             })
         } else {
@@ -833,8 +840,14 @@ impl Server {
                 "ready": false,
                 "scanning": false,
                 "indexed_count": 0,
+                "snapshot_dirty": false,
+                "watch_enabled": false,
+                "scan_interval": 0,
+                "snapshot_interval": 0,
                 "last_scan_at": null,
                 "last_snapshot_at": null,
+                "last_scan_duration_ms": null,
+                "last_snapshot_duration_ms": null,
                 "last_error": null,
             })
         };
