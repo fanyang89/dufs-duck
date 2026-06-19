@@ -363,24 +363,7 @@ fn run_worker(
                 && snapshot_dirty
                 && snapshot_dirty_at.elapsed() >= Duration::from_secs(snapshot_interval)
             {
-                let start = Instant::now();
-                if let Err(err) = db.refresh_snapshot() {
-                    update_status(&status, |status| {
-                        status.last_error = Some(err.to_string());
-                    });
-                    warn!("failed to refresh index snapshot: {err}");
-                } else {
-                    let indexed_count = db.indexed_count().unwrap_or_default();
-                    update_status(&status, |status| {
-                        status.ready = true;
-                        status.indexed_count = indexed_count;
-                        status.snapshot_dirty = false;
-                        status.last_snapshot_at = Some(now_millis());
-                        status.last_snapshot_duration_ms = Some(duration_millis(start.elapsed()));
-                        status.last_error = None;
-                    });
-                    snapshot_dirty = false;
-                }
+                snapshot_dirty = !refresh_dirty_snapshot(&mut db, &status);
             }
             continue;
         };
@@ -480,7 +463,32 @@ fn run_worker(
             }
         }
     }
+    if snapshot_dirty {
+        let _ = refresh_dirty_snapshot(&mut db, &status);
+    }
     Ok(())
+}
+
+fn refresh_dirty_snapshot(db: &mut IndexDb, status: &Arc<Mutex<IndexStatus>>) -> bool {
+    let start = Instant::now();
+    if let Err(err) = db.refresh_snapshot() {
+        update_status(status, |status| {
+            status.last_error = Some(err.to_string());
+        });
+        warn!("failed to refresh index snapshot: {err}");
+        false
+    } else {
+        let indexed_count = db.indexed_count().unwrap_or_default();
+        update_status(status, |status| {
+            status.ready = true;
+            status.indexed_count = indexed_count;
+            status.snapshot_dirty = false;
+            status.last_snapshot_at = Some(now_millis());
+            status.last_snapshot_duration_ms = Some(duration_millis(start.elapsed()));
+            status.last_error = None;
+        });
+        true
+    }
 }
 
 fn update_status(status: &Arc<Mutex<IndexStatus>>, update: impl FnOnce(&mut IndexStatus)) {
