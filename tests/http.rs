@@ -172,6 +172,31 @@ fn indexed_remote_db(
 }
 
 #[rstest]
+fn indexed_remote_db_head_and_range(
+    #[with(&["-A", "--enable-index", "--index-remote", "--index-scan-interval", "0"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}__dufs__/index.duckdb", server.url());
+    wait_response_ok(|| reqwest::blocking::get(&url))?;
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client.head(&url).send()?;
+    assert_eq!(resp.status(), 200);
+    let content_length = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert!(content_length > 16);
+
+    let resp = client.get(&url).header("range", "bytes=8-11").send()?;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.text()?, "DUCK");
+    Ok(())
+}
+
+#[rstest]
 fn indexed_remote_db_forbidden(
     #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
 ) -> Result<(), Error> {
