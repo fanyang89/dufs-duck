@@ -1,5 +1,6 @@
+use crate::fts::{self, FtsIndex};
 use crate::server::{PathItem, PathType};
-use crate::utils::get_file_name;
+use crate::utils::{duckdb_search_like_pattern, get_file_name};
 
 use anyhow::Result;
 use duckdb::{params, Connection};
@@ -19,6 +20,7 @@ const INDEX_SCAN_TARGET_LATENCY_MS: u64 = 100;
 const INDEX_SCAN_MAX_DELAY_MS: u64 = 100;
 const INDEX_WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 const INDEX_SCHEMA_VERSION: u64 = 1;
+const FTS_CANDIDATE_LIMIT: usize = 10_000;
 
 #[derive(Clone, Copy)]
 enum WatchAction {
@@ -96,6 +98,13 @@ pub struct IndexStatus {
     pub last_snapshot_at: Option<u64>,
     pub last_scan_duration_ms: Option<u64>,
     pub last_snapshot_duration_ms: Option<u64>,
+    pub fts_enabled: bool,
+    pub fts_ready: bool,
+    pub fts_dirty: bool,
+    pub fts_indexed_count: u64,
+    pub last_fts_rebuild_at: Option<u64>,
+    pub last_fts_rebuild_duration_ms: Option<u64>,
+    pub last_fts_error: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -159,6 +168,7 @@ impl Indexer {
         watch: bool,
         scan_interval: u64,
         snapshot_interval: u64,
+        fts_enabled: bool,
         running: Arc<AtomicBool>,
         load: Arc<ServerLoad>,
     ) -> Result<Self> {
@@ -172,6 +182,7 @@ impl Indexer {
             status.watch_enabled = watch;
             status.scan_interval = scan_interval;
             status.snapshot_interval = snapshot_interval;
+            status.fts_enabled = fts_enabled;
         });
         let worker_status = status.clone();
         let worker_error_status = status.clone();
@@ -190,6 +201,7 @@ impl Indexer {
                 follow_symlinks,
                 load,
                 snapshot_interval,
+                fts_enabled,
                 worker_queue,
                 worker_status,
                 worker_running,
@@ -340,6 +352,7 @@ fn run_worker(
     follow_symlinks: bool,
     load: Arc<ServerLoad>,
     snapshot_interval: u64,
+    fts_enabled: bool,
     queue: IndexQueue,
     status: Arc<Mutex<IndexStatus>>,
     running: Arc<AtomicBool>,
@@ -350,6 +363,7 @@ fn run_worker(
         snapshot_path,
         hidden,
         follow_symlinks,
+        fts_enabled,
         load,
     )?;
     update_status(&status, |status| {
@@ -397,6 +411,7 @@ fn run_worker(
                     });
                     warn!("failed to scan index: {err}");
                 } else {
+                    update_fts_status(&mut db, &status);
                     let indexed_count = db.indexed_count().unwrap_or_default();
                     update_status(&status, |status| {
                         status.ready = true;
@@ -416,6 +431,7 @@ fn run_worker(
                 if let Err(err) = db.scan_path(&path) {
                     warn!("failed to scan {}: {err}", path.display());
                 } else {
+                    update_fts_status(&mut db, &status);
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
                     update_status(&status, |status| status.snapshot_dirty = true);
@@ -425,6 +441,7 @@ fn run_worker(
                 if let Err(err) = db.upsert_path(&path) {
                     warn!("failed to index {}: {err}", path.display());
                 } else {
+                    update_fts_status(&mut db, &status);
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
                     update_status(&status, |status| status.snapshot_dirty = true);
@@ -434,6 +451,7 @@ fn run_worker(
                 if let Err(err) = db.remove_path(&path) {
                     warn!("failed to remove {} from index: {err}", path.display());
                 } else {
+                    update_fts_status(&mut db, &status);
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
                     update_status(&status, |status| status.snapshot_dirty = true);
@@ -447,6 +465,7 @@ fn run_worker(
                         to.display()
                     );
                 } else {
+                    update_fts_status(&mut db, &status);
                     snapshot_dirty = true;
                     snapshot_dirty_at = Instant::now();
                     update_status(&status, |status| status.snapshot_dirty = true);
@@ -489,6 +508,18 @@ fn refresh_dirty_snapshot(db: &mut IndexDb, status: &Arc<Mutex<IndexStatus>>) ->
         });
         true
     }
+}
+
+fn update_fts_status(db: &mut IndexDb, status: &Arc<Mutex<IndexStatus>>) {
+    update_status(status, |status| {
+        status.fts_enabled = db.fts_enabled;
+        status.fts_ready = db.fts.is_some() && db.fts_ready;
+        status.fts_dirty = db.fts_dirty;
+        status.fts_indexed_count = db.fts_indexed_count;
+        status.last_fts_rebuild_at = db.last_fts_rebuild_at;
+        status.last_fts_rebuild_duration_ms = db.last_fts_rebuild_duration_ms;
+        status.last_fts_error.clone_from(&db.last_fts_error);
+    });
 }
 
 fn update_status(status: &Arc<Mutex<IndexStatus>>, update: impl FnOnce(&mut IndexStatus)) {
@@ -568,6 +599,14 @@ struct IndexDb {
     follow_symlinks: bool,
     generation: u64,
     throttle: IndexThrottle,
+    fts_enabled: bool,
+    fts: Option<FtsIndex>,
+    fts_ready: bool,
+    fts_dirty: bool,
+    fts_indexed_count: u64,
+    last_fts_rebuild_at: Option<u64>,
+    last_fts_rebuild_duration_ms: Option<u64>,
+    last_fts_error: Option<String>,
 }
 
 struct IndexThrottle {
@@ -628,6 +667,7 @@ impl IndexDb {
         snapshot_path: PathBuf,
         hidden: Vec<String>,
         follow_symlinks: bool,
+        fts_enabled: bool,
         load: Arc<ServerLoad>,
     ) -> Result<Self> {
         let conn = Connection::open(&db_path)?;
@@ -637,6 +677,17 @@ impl IndexDb {
             [],
             |row| row.get(0),
         )?;
+        let (fts, last_fts_error) = if fts_enabled {
+            match FtsIndex::open(&db_path.with_file_name("index.fts")) {
+                Ok(fts) => (Some(fts), None),
+                Err(err) => {
+                    warn!("failed to open fts index: {err}");
+                    (None, Some(err.to_string()))
+                }
+            }
+        } else {
+            (None, None)
+        };
         Ok(Self {
             conn,
             db_path,
@@ -646,6 +697,14 @@ impl IndexDb {
             follow_symlinks,
             generation,
             throttle: IndexThrottle::new(load),
+            fts_enabled,
+            fts,
+            fts_ready: false,
+            fts_dirty: fts_enabled,
+            fts_indexed_count: 0,
+            last_fts_rebuild_at: None,
+            last_fts_rebuild_duration_ms: None,
+            last_fts_error,
         })
     }
 
@@ -657,12 +716,15 @@ impl IndexDb {
             "DELETE FROM files WHERE scan_generation <> ?",
             params![generation],
         )?;
+        self.rebuild_fts();
         self.refresh_snapshot()?;
         Ok(())
     }
 
     fn scan_path(&mut self, path: &Path) -> Result<()> {
-        self.scan_path_with_generation(path, self.generation, &mut |_| {})
+        self.scan_path_with_generation(path, self.generation, &mut |_| {})?;
+        self.sync_fts_path(path);
+        Ok(())
     }
 
     fn scan_path_with_generation(
@@ -705,7 +767,9 @@ impl IndexDb {
     }
 
     fn upsert_path(&mut self, path: &Path) -> Result<()> {
-        self.upsert_path_with_generation(path, self.generation)
+        self.upsert_path_with_generation(path, self.generation)?;
+        self.sync_fts_path(path);
+        Ok(())
     }
 
     fn upsert_path_with_generation(&mut self, path: &Path, generation: u64) -> Result<()> {
@@ -766,11 +830,134 @@ impl IndexDb {
             Ok(rel) => normalize_path(rel),
             Err(_) => return Ok(()),
         };
+        let fts_paths = self.fts_paths_under(&rel).unwrap_or_default();
         self.conn.execute(
             "DELETE FROM files WHERE path = ? OR path LIKE ?",
             params![rel, format!("{rel}/%")],
         )?;
+        self.delete_fts_paths(&fts_paths);
         Ok(())
+    }
+
+    fn rebuild_fts(&mut self) {
+        if self.fts.is_none() {
+            return;
+        }
+        let start = Instant::now();
+        let rebuild = self.fts_entries().and_then(|entries| {
+            self.fts
+                .as_mut()
+                .expect("fts checked above")
+                .rebuild(&entries)
+        });
+        match rebuild {
+            Ok(count) => {
+                self.fts_ready = true;
+                self.fts_dirty = false;
+                self.fts_indexed_count = count;
+                self.last_fts_rebuild_at = Some(now_millis());
+                self.last_fts_rebuild_duration_ms = Some(duration_millis(start.elapsed()));
+                self.last_fts_error = None;
+            }
+            Err(err) => {
+                self.fts_ready = false;
+                self.fts_dirty = true;
+                self.last_fts_error = Some(err.to_string());
+                warn!("failed to rebuild fts index: {err}");
+            }
+        }
+    }
+
+    fn sync_fts_path(&mut self, path: &Path) {
+        if self.fts.is_none() {
+            return;
+        }
+        let rel = match path.strip_prefix(&self.serve_path) {
+            Ok(rel) => normalize_path(rel),
+            Err(_) => return,
+        };
+        let entries = match self.fts_entries_under(&rel) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.fts_dirty = true;
+                self.last_fts_error = Some(err.to_string());
+                warn!("failed to read fts entries for {}: {err}", path.display());
+                return;
+            }
+        };
+        let update = (|| -> Result<()> {
+            let fts = self.fts.as_mut().expect("fts checked above");
+            for (path, name) in &entries {
+                fts.upsert(path, name)?;
+            }
+            fts.commit()?;
+            Ok(())
+        })();
+        match update {
+            Ok(()) => {
+                if self.fts_ready {
+                    self.fts_indexed_count = self.indexed_count().unwrap_or(self.fts_indexed_count);
+                }
+                self.fts_dirty = !self.fts_ready;
+                self.last_fts_error = None;
+            }
+            Err(err) => {
+                self.fts_dirty = true;
+                self.last_fts_error = Some(err.to_string());
+                warn!("failed to update fts index for {}: {err}", path.display());
+            }
+        }
+    }
+
+    fn delete_fts_paths(&mut self, paths: &[String]) {
+        let Some(fts) = self.fts.as_mut() else {
+            return;
+        };
+        let update = (|| -> Result<()> {
+            for path in paths {
+                fts.delete(path);
+            }
+            fts.commit()?;
+            Ok(())
+        })();
+        match update {
+            Ok(()) => {
+                if self.fts_ready {
+                    self.fts_indexed_count = self.indexed_count().unwrap_or(self.fts_indexed_count);
+                }
+                self.fts_dirty = !self.fts_ready;
+                self.last_fts_error = None;
+            }
+            Err(err) => {
+                self.fts_dirty = true;
+                self.last_fts_error = Some(err.to_string());
+                warn!("failed to delete fts paths: {err}");
+            }
+        }
+    }
+
+    fn fts_entries(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, name FROM files")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    fn fts_entries_under(&self, rel: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, name FROM files WHERE path = ? OR path LIKE ?")?;
+        let rows = stmt.query_map(params![rel, format!("{rel}/%")], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    fn fts_paths_under(&self, rel: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE path = ? OR path LIKE ?")?;
+        let rows = stmt.query_map(params![rel, format!("{rel}/%")], |row| row.get(0))?;
+        rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
@@ -791,17 +978,45 @@ impl IndexDb {
         limit: u64,
         access_paths: &[String],
     ) -> Result<Vec<PathItem>> {
+        if let Some(candidate_paths) = self.fts_candidates(q, limit) {
+            return self.search_like(base, q, limit, access_paths, Some(&candidate_paths));
+        }
+        self.search_like(base, q, limit, access_paths, None)
+    }
+
+    fn search_like(
+        &self,
+        base: &Path,
+        q: &str,
+        limit: u64,
+        access_paths: &[String],
+        candidate_paths: Option<&[String]>,
+    ) -> Result<Vec<PathItem>> {
+        if candidate_paths.is_some_and(|paths| paths.is_empty()) {
+            return Ok(vec![]);
+        }
         let base_rel = normalize_path(base.strip_prefix(&self.serve_path)?);
         let path_like = if base_rel.is_empty() {
             "%".to_string()
         } else {
             format!("{base_rel}/%")
         };
-        let q_like = format!("%{}%", q.to_lowercase());
+        let q_like = duckdb_search_like_pattern(q);
         let access_filter = build_access_filter(access_paths);
+        let candidate_filter = candidate_paths
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| {
+                let paths = paths
+                    .iter()
+                    .map(|path| format!("'{}'", escape_sql_string(path)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" AND path IN ({paths})")
+            })
+            .unwrap_or_default();
         let sql = format!(
             "SELECT path, path_type, size, mtime FROM files
-             WHERE path LIKE ? AND (lower(name) LIKE ? OR lower(path) LIKE ?) AND ({access_filter})
+             WHERE path LIKE ? AND (lower(name) LIKE ? ESCAPE '$' OR lower(path) LIKE ? ESCAPE '$') AND ({access_filter}){candidate_filter}
              ORDER BY CASE WHEN path_type IN ('Dir', 'SymlinkDir') THEN 0 ELSE 1 END, lower(path)
              LIMIT ?"
         );
@@ -826,6 +1041,29 @@ impl IndexDb {
             })
         })?;
         rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    fn fts_candidates(&self, q: &str, limit: u64) -> Option<Vec<String>> {
+        if !self.fts_ready || !fts::can_accelerate(q) {
+            return None;
+        }
+        let fts = self.fts.as_ref()?;
+        let min_limit = (limit as usize).min(FTS_CANDIDATE_LIMIT);
+        let limit = (limit as usize)
+            .saturating_mul(20)
+            .clamp(min_limit, FTS_CANDIDATE_LIMIT);
+        match fts.search(q, limit) {
+            Ok(result) => {
+                if result.total_hits > result.paths.len() {
+                    return None;
+                }
+                Some(result.paths)
+            }
+            Err(err) => {
+                warn!("fts search failed, falling back to duckdb search: {err}");
+                None
+            }
+        }
     }
 
     fn indexed_count(&self) -> Result<u64> {
@@ -935,6 +1173,10 @@ fn build_access_filter(access_paths: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn parse_path_type(value: &str) -> PathType {

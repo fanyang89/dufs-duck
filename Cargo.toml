@@ -57,6 +57,7 @@ hex = "0.4.3"
 duckdb = { version = "1.10504.0", features = ["bundled"] }
 ignore = "0.4.26"
 notify = "8.2.0"
+tantivy = "0.25"
 
 [features]
 default = ["tls"]

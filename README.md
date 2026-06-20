@@ -67,6 +67,7 @@ Options:
       --enable-index         Enable DuckDB file indexing
       --index-db <file>      Path to the DuckDB index database
       --index-remote         Expose a read-only DuckDB index snapshot over HTTP
+      --index-fts            Enable Tantivy full-text search acceleration for the DuckDB index
       --index-watch          Watch the file system and update the index
       --no-index-watch       Disable file system watching for the index
       --index-scan-interval <seconds>
@@ -197,6 +198,7 @@ List/search directory contents
 
 ```sh
 curl http://127.0.0.1:5000?q=Dockerfile           # search for files, similar to `find -name Dockerfile`
+curl 'http://127.0.0.1:5000?q=*.html'             # search with wildcard; `*` matches many chars, `?` matches one char
 curl http://127.0.0.1:5000?simple                 # output names only, similar to `ls -1`
 curl http://127.0.0.1:5000?json                   # output paths in json format
 ```
@@ -358,7 +360,8 @@ dufs-duck -A --enable-index
 When indexing is enabled:
 
 - Startup triggers a background full scan.
-- Search requests such as `?q=report` use the DuckDB index.
+- Search requests such as `?q=report` and wildcard searches such as `?q=*.html` use the DuckDB index.
+- `--index-fts` enables an additional Tantivy ngram index for faster ordinary `?q=report` searches. DuckDB remains the source of truth and final result filter.
 - The file system watcher updates the index for external changes by default.
 - A periodic scan runs every 300 seconds by default; set `--index-scan-interval 0` to disable it.
 - Remote DuckDB snapshots refresh every 5 seconds after incremental changes by default; set `--index-snapshot-interval 0` to disable incremental snapshot refreshes.
@@ -438,6 +441,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --enable-index          DUFS_ENABLE_INDEX=true
     --index-db <file>       DUFS_INDEX_DB=./.dufs/index.duckdb
     --index-remote          DUFS_INDEX_REMOTE=true
+    --index-fts             DUFS_INDEX_FTS=true
     --index-watch           DUFS_INDEX_WATCH=true
     --no-index-watch        DUFS_NO_INDEX_WATCH=true
     --index-scan-interval   DUFS_INDEX_SCAN_INTERVAL=300
@@ -484,6 +488,7 @@ allow-hash: true
 enable-index: true
 index-db: ./.dufs/index.duckdb
 index-remote: true
+index-fts: true
 index-watch: true
 index-scan-interval: 300
 index-snapshot-interval: 5

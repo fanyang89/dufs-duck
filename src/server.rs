@@ -4,7 +4,9 @@ use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream, TrackedStream};
 use crate::indexer::{Indexer, ServerLoad};
 use crate::noscript::{detect_noscript, generate_noscript_html};
-use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
+use crate::utils::{
+    decode_uri, encode_uri, get_file_name, glob, parse_range, search_match, try_get_file_name,
+};
 use crate::Args;
 
 use anyhow::{anyhow, Result};
@@ -109,6 +111,7 @@ impl Server {
                 args.index_watch,
                 args.index_scan_interval,
                 args.index_snapshot_interval,
+                args.index_fts,
                 running.clone(),
                 load.clone(),
             )?)
@@ -720,7 +723,7 @@ impl Server {
             hidden,
             self.args.allow_symlink,
             self.args.serve_path.clone(),
-            move |x| get_file_name(x.path()).to_lowercase().contains(&search),
+            move |x| search_match(&search, get_file_name(x.path())),
         ))
         .await?;
 
@@ -827,10 +830,17 @@ impl Server {
                 "scan_interval": status.scan_interval,
                 "snapshot_interval": status.snapshot_interval,
                 "queued_commands": status.queued_commands,
+                "fts_enabled": status.fts_enabled,
+                "fts_ready": status.fts_ready,
+                "fts_dirty": status.fts_dirty,
+                "fts_indexed_count": status.fts_indexed_count,
                 "last_scan_at": status.last_scan_at,
                 "last_snapshot_at": status.last_snapshot_at,
+                "last_fts_rebuild_at": status.last_fts_rebuild_at,
                 "last_scan_duration_ms": status.last_scan_duration_ms,
                 "last_snapshot_duration_ms": status.last_snapshot_duration_ms,
+                "last_fts_rebuild_duration_ms": status.last_fts_rebuild_duration_ms,
+                "last_fts_error": status.last_fts_error,
                 "last_error": status.last_error,
             })
         } else {
@@ -846,10 +856,17 @@ impl Server {
                 "scan_interval": 0,
                 "snapshot_interval": 0,
                 "queued_commands": 0,
+                "fts_enabled": false,
+                "fts_ready": false,
+                "fts_dirty": false,
+                "fts_indexed_count": 0,
                 "last_scan_at": null,
                 "last_snapshot_at": null,
+                "last_fts_rebuild_at": null,
                 "last_scan_duration_ms": null,
                 "last_snapshot_duration_ms": null,
+                "last_fts_rebuild_duration_ms": null,
+                "last_fts_error": null,
                 "last_error": null,
             })
         };

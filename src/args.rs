@@ -182,6 +182,14 @@ pub fn build_cli() -> Command {
                 .help("Expose a read-only DuckDB index snapshot over HTTP"),
         )
         .arg(
+            Arg::new("index-fts")
+                .env("DUFS_INDEX_FTS")
+                .hide_env(true)
+                .long("index-fts")
+                .action(ArgAction::SetTrue)
+                .help("Enable Tantivy full-text search acceleration for the DuckDB index"),
+        )
+        .arg(
             Arg::new("index-watch")
                 .env("DUFS_INDEX_WATCH")
                 .hide_env(true)
@@ -353,6 +361,7 @@ pub struct Args {
     pub enable_index: bool,
     pub index_db: Option<PathBuf>,
     pub index_remote: bool,
+    pub index_fts: bool,
     #[serde(default = "default_index_watch")]
     #[default(default_index_watch())]
     pub index_watch: bool,
@@ -466,6 +475,9 @@ impl Args {
         if !args.index_remote {
             args.index_remote = matches.get_flag("index-remote");
         }
+        if !args.index_fts {
+            args.index_fts = matches.get_flag("index-fts");
+        }
         if let Some(index_db) = matches.get_one::<PathBuf>("index-db") {
             args.index_db = Some(index_db.clone());
         }
@@ -547,6 +559,9 @@ impl Args {
 
         if args.index_remote && !args.enable_index {
             bail!("--index-remote requires --enable-index");
+        }
+        if args.index_fts && !args.enable_index {
+            bail!("--index-fts requires --enable-index");
         }
         if args.index_remote && args.index_snapshot_interval == 0 {
             warn!("--index-snapshot-interval 0 disables incremental remote index snapshots");
@@ -819,6 +834,14 @@ mod tests {
             .unwrap();
         let err = Args::parse(matches).unwrap_err().to_string();
         assert!(err.contains("--index-remote requires --enable-index"));
+    }
+
+    #[test]
+    fn test_index_fts_requires_index() {
+        let cli = build_cli();
+        let matches = cli.try_get_matches_from(vec!["", "--index-fts"]).unwrap();
+        let err = Args::parse(matches).unwrap_err().to_string();
+        assert!(err.contains("--index-fts requires --enable-index"));
     }
 
     #[test]

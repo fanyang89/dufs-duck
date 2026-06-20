@@ -124,6 +124,19 @@ fn get_dir_search(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn get_dir_search_wildcard(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let q = urlencoding::encode("*.html");
+    let resp = reqwest::blocking::get(format!("{}?q={q}&simple", server.url()))?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text()?;
+    let paths: Vec<_> = text.lines().collect();
+    assert!(paths.contains(&"test.html"));
+    assert!(paths.contains(&"dir1/test.html"));
+    assert!(paths.iter().all(|path| path.ends_with(".html")));
+    Ok(())
+}
+
+#[rstest]
 fn get_dir_indexed_search(
     #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
 ) -> Result<(), Error> {
@@ -132,6 +145,123 @@ fn get_dir_indexed_search(
         "test.html",
     )?;
     assert!(text.split('\n').any(|v| v == "test.html"));
+    Ok(())
+}
+
+#[rstest]
+fn get_dir_indexed_search_wildcard(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    let q = urlencoding::encode("*.html");
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={q}&simple", server.url())),
+        "dir1/test.html",
+    )?;
+    let paths: Vec<_> = text.lines().collect();
+    assert!(paths.contains(&"test.html"));
+    assert!(paths.contains(&"dir1/test.html"));
+    assert!(paths.iter().all(|path| path.ends_with(".html")));
+    Ok(())
+}
+
+#[rstest]
+fn get_dir_indexed_fts_search(
+    #[with(&[
+        "-A",
+        "--enable-index",
+        "--index-fts",
+        "--index-scan-interval",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let value = wait_json_value(
+        || reqwest::blocking::get(format!("{}__dufs__/index/status", server.url())),
+        |value| value["fts_ready"] == true,
+    )?;
+    assert_eq!(value["fts_enabled"], true);
+    assert!(value["fts_indexed_count"].as_u64().unwrap_or_default() > 0);
+
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={}&simple", server.url(), "test.html")),
+        "test.html",
+    )?;
+    assert!(text.lines().any(|v| v == "test.html"));
+    Ok(())
+}
+
+#[rstest]
+fn indexed_fts_count_updates_after_write(
+    #[with(&[
+        "-A",
+        "--enable-index",
+        "--index-fts",
+        "--index-scan-interval",
+        "0"
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let value = wait_json_value(
+        || reqwest::blocking::get(format!("{}__dufs__/index/status", server.url())),
+        |value| value["fts_ready"] == true,
+    )?;
+    let initial_count = value["fts_indexed_count"].as_u64().unwrap_or_default();
+
+    let url = format!("{}fts-count-new.txt", server.url());
+    let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
+    assert_eq!(resp.status(), 201);
+
+    wait_json_value(
+        || reqwest::blocking::get(format!("{}__dufs__/index/status", server.url())),
+        |value| value["fts_indexed_count"].as_u64() == Some(initial_count + 1),
+    )?;
+
+    let resp = fetch!(b"DELETE", &url).send()?;
+    assert_eq!(resp.status(), 204);
+
+    wait_json_value(
+        || reqwest::blocking::get(format!("{}__dufs__/index/status", server.url())),
+        |value| value["fts_indexed_count"].as_u64() == Some(initial_count),
+    )?;
+    Ok(())
+}
+
+#[rstest]
+fn get_dir_indexed_search_escapes_like_wildcards(
+    #[with(&["-A", "--enable-index", "--index-scan-interval", "0"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::write(server.path().join("literal-percent%.txt"), b"percent")?;
+    std::fs::write(server.path().join("literal-percentx.txt"), b"percent decoy")?;
+    std::fs::write(server.path().join("literal_under_score.txt"), b"underscore")?;
+    std::fs::write(
+        server.path().join("literalXunderYscore.txt"),
+        b"underscore decoy",
+    )?;
+
+    let decoy_q = urlencoding::encode("literal-percentx.txt");
+    wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={decoy_q}&simple", server.url())),
+        "literal-percentx.txt",
+    )?;
+    let decoy_q = urlencoding::encode("literalXunderYscore.txt");
+    wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={decoy_q}&simple", server.url())),
+        "literalXunderYscore.txt",
+    )?;
+
+    let q = urlencoding::encode("literal-percent%.txt");
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={q}&simple", server.url())),
+        "literal-percent%.txt",
+    )?;
+    assert!(!text.contains("literal-percentx.txt"));
+
+    let q = urlencoding::encode("literal_under_score.txt");
+    let text = wait_text_contains(
+        || reqwest::blocking::get(format!("{}?q={q}&simple", server.url())),
+        "literal_under_score.txt",
+    )?;
+    assert!(!text.contains("literalXunderYscore.txt"));
     Ok(())
 }
 

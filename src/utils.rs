@@ -45,6 +45,77 @@ pub fn glob(pattern: &str, target: &str) -> bool {
     pat.matches(target)
 }
 
+pub fn search_match(search: &str, target: &str) -> bool {
+    let search = search.to_lowercase();
+    let target = target.to_lowercase();
+    if has_search_wildcard(&search) {
+        wildcard_match(&search, &target)
+    } else {
+        target.contains(&search)
+    }
+}
+
+pub fn duckdb_search_like_pattern(search: &str) -> String {
+    let search = search.to_lowercase();
+    let has_wildcard = has_search_wildcard(&search);
+    let mut pattern = String::new();
+    if !has_wildcard {
+        pattern.push('%');
+    }
+    for ch in search.chars() {
+        match ch {
+            '*' if has_wildcard => pattern.push('%'),
+            '?' if has_wildcard => pattern.push('_'),
+            '$' | '%' | '_' => {
+                pattern.push('$');
+                pattern.push(ch);
+            }
+            _ => pattern.push(ch),
+        }
+    }
+    if !has_wildcard {
+        pattern.push('%');
+    }
+    pattern
+}
+
+pub fn has_search_wildcard(search: &str) -> bool {
+    search.contains('*') || search.contains('?')
+}
+
+fn wildcard_match(pattern: &str, target: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let target: Vec<char> = target.chars().collect();
+    let mut pattern_index = 0;
+    let mut target_index = 0;
+    let mut star_index = None;
+    let mut star_target_index = 0;
+
+    while target_index < target.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == target[target_index])
+        {
+            pattern_index += 1;
+            target_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_target_index = target_index;
+        } else if let Some(index) = star_index {
+            pattern_index = index + 1;
+            star_target_index += 1;
+            target_index = star_target_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
 // Load public certificate from file.
 #[cfg(feature = "tls")]
 pub fn load_certs<T: AsRef<Path>>(file_name: T) -> Result<Vec<CertificateDer<'static>>> {
@@ -152,6 +223,26 @@ mod tests {
         assert!(glob("*.log", "a.log"));
         assert!(glob("*/", "abc/"));
         assert!(!glob("*/", "abc"));
+    }
+
+    #[test]
+    fn test_search_match() {
+        assert!(search_match("test", "my-test.txt"));
+        assert!(search_match("*.txt", "my-test.txt"));
+        assert!(search_match("my-????.txt", "my-test.txt"));
+        assert!(search_match("😀.?in", "😀.bin"));
+        assert!(!search_match("*.html", "my-test.txt"));
+        assert!(!search_match("my-???.txt", "my-test.txt"));
+    }
+
+    #[test]
+    fn test_duckdb_search_like_pattern() {
+        assert_eq!(duckdb_search_like_pattern("test"), "%test%");
+        assert_eq!(duckdb_search_like_pattern("*.html"), "%.html");
+        assert_eq!(duckdb_search_like_pattern("file?.txt"), "file_.txt");
+        assert_eq!(duckdb_search_like_pattern("100%.txt"), "%100$%.txt%");
+        assert_eq!(duckdb_search_like_pattern("a_b"), "%a$_b%");
+        assert_eq!(duckdb_search_like_pattern("a$b"), "%a$$b%");
     }
 
     #[test]
