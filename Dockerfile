@@ -9,6 +9,6 @@ RUN cargo install --path . --root /
 FROM ${TARGETARCH} AS builder
 
 FROM scratch
-COPY --from=builder /bin/dufs /bin/dufs
+COPY --from=builder /bin/dufs-duck /bin/dufs-duck
 STOPSIGNAL SIGINT
-ENTRYPOINT ["/bin/dufs"]
+ENTRYPOINT ["/bin/dufs-duck"]

@@ -14,7 +14,7 @@ use crate::http_logger::HttpLogger;
 use crate::utils::{encode_uri, is_ipv6_available};
 
 pub fn build_cli() -> Command {
-    let app = Command::new(env!("CARGO_CRATE_NAME"))
+    let app = Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(concat!(

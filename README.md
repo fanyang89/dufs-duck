@@ -1,10 +1,8 @@
-# Dufs
+# Dufs Duck
 
-[![CI](https://github.com/sigoden/dufs/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/dufs/actions/workflows/ci.yaml)
-[![Crates](https://img.shields.io/crates/v/dufs.svg)](https://crates.io/crates/dufs)
-[![Docker Pulls](https://img.shields.io/docker/pulls/sigoden/dufs)](https://hub.docker.com/r/sigoden/dufs)
+[![CI](https://github.com/fanyang89/dufs-duck/actions/workflows/ci.yaml/badge.svg)](https://github.com/fanyang89/dufs-duck/actions/workflows/ci.yaml)
 
-Dufs is a distinctive utility file server that supports static serving, uploading, searching, accessing control, webdav...
+Dufs Duck is a variant of Dufs, not the official upstream version. It is a distinctive utility file server that supports static serving, uploading, searching, accessing control, webdav...
 
 ![demo](https://user-images.githubusercontent.com/4012553/220513063-ff0f186b-ac54-4682-9af4-47a9781dee0d.png)
 
@@ -25,31 +23,29 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 ### With cargo
 
 ```
-cargo install dufs
+cargo install --path .
 ```
 
 ### With docker
 
 ```
-docker run -v `pwd`:/data -p 5000:5000 --rm sigoden/dufs /data -A
+docker run -v `pwd`:/data -p 5000:5000 --rm fanyang89/dufs-duck /data -A
 ```
 
 ### With [Homebrew](https://brew.sh)
 
-```
-brew install dufs
-```
+No Homebrew formula is provided for this variant yet.
 
 ### Binaries on macOS, Linux, Windows
 
-Download from [Github Releases](https://github.com/sigoden/dufs/releases), unzip and add dufs to your $PATH.
+Download from [Github Releases](https://github.com/fanyang89/dufs-duck/releases), unzip and add `dufs-duck` to your $PATH.
 
 ## CLI
 
 ```
-Dufs is a distinctive utility file server - https://github.com/sigoden/dufs
+Dufs Duck is a variant of Dufs - https://github.com/fanyang89/dufs-duck
 
-Usage: dufs [OPTIONS] [serve-path]
+Usage: dufs-duck [OPTIONS] [serve-path]
 
 Arguments:
   [serve-path]  Specific path to serve [default: .]
@@ -97,66 +93,66 @@ Options:
 Serve current working directory in read-only mode
 
 ```
-dufs
+dufs-duck
 ```
 
 Allow all operations like upload/delete/search/create/edit...
 
 ```
-dufs -A
+dufs-duck -A
 ```
 
 Only allow upload operation
 
 ```
-dufs --allow-upload
+dufs-duck --allow-upload
 ```
 
 Serve a specific directory
 
 ```
-dufs Downloads
+dufs-duck Downloads
 ```
 
 Serve a single file
 
 ```
-dufs linux-distro.iso
+dufs-duck linux-distro.iso
 ```
 
 Serve a single-page application like react/vue
 
 ```
-dufs --render-spa
+dufs-duck --render-spa
 ```
 
 Serve a static website with index.html
 
 ```
-dufs --render-index
+dufs-duck --render-index
 ```
 
 Require username/password
 
 ```
-dufs -a admin:123@/:rw
+dufs-duck -a admin:123@/:rw
 ```
 
 Listen on specific host:ip 
 
 ```
-dufs -b 127.0.0.1 -p 80
+dufs-duck -b 127.0.0.1 -p 80
 ```
 
 Listen on unix socket
 ```
-dufs -b /tmp/dufs.socket
+dufs-duck -b /tmp/dufs.socket
 ```
 
 Use https
 
 ```
-dufs --tls-cert my.crt --tls-key my.key
+dufs-duck --tls-cert my.crt --tls-key my.key
 ```
 
 ## API
@@ -246,8 +242,8 @@ curl http://127.0.0.1:5000/__dufs__/health
 Dufs supports account based access control. You can control who can do what on which path with `--auth`/`-a`.
 
 ```
-dufs -a admin:admin@/:rw -a guest:guest@/
-dufs -a user:pass@/:rw,/dir1 -a @/
+dufs-duck -a admin:admin@/:rw -a guest:guest@/
+dufs-duck -a user:pass@/:rw,/dir1 -a @/
 ```
 
 1. Use `@` to separate the account and paths. No account means anonymous user.
@@ -276,7 +272,7 @@ $6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRu
 Use hashed password:
 
 ```sh
-dufs -a 'admin:$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/@/:rw'
+dufs-duck -a 'admin:$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/@/:rw'
 ```
 > The hashed password contains `$6`, which can expand to a variable in some shells, so you have to use **single quotes** to wrap it.
 
@@ -291,16 +287,16 @@ Two important things for hashed passwords:
 Dufs supports hiding paths from directory listings via option `--hidden <glob>,...`.
 
 ```
-dufs --hidden .git,.DS_Store,tmp
+dufs-duck --hidden .git,.DS_Store,tmp
 ```
 
 > The glob used in --hidden only matches file and directory names, not paths. So `--hidden dir1/file` is invalid.
 
 ```sh
-dufs --hidden '.*'                          # hidden dotfiles
-dufs --hidden '*/'                          # hidden all folders
-dufs --hidden '*.log,*.lock'                # hidden by exts
-dufs --hidden '*.log' --hidden '*.lock'
+dufs-duck --hidden '.*'                          # hidden dotfiles
+dufs-duck --hidden '*/'                          # hidden all folders
+dufs-duck --hidden '*.log,*.lock'                # hidden by exts
+dufs-duck --hidden '*.log' --hidden '*.lock'
 ```
 
 ### Log Format
@@ -325,19 +321,19 @@ The default log format is `'$time_iso8601 $log_level - $remote_addr "$request" $
 
 A json log format is also supported.
 ```
-dufs --log-format '{"time":"$time_local","addr":"$remote_addr","uri":"$request_uri", "method":"$request_method","status":$status}'
+dufs-duck --log-format '{"time":"$time_local","addr":"$remote_addr","uri":"$request_uri", "method":"$request_method","status":$status}'
 
 {"time":"2022-08-06T06:59:31+08:00","addr":"127.0.0.1","uri":"/", "method":"GET","status":200}
 ```
 
 Disable http log
 ```
-dufs --log-format=''
+dufs-duck --log-format=''
 ```
 
 Log user-agent
 ```
-dufs --log-format '$remote_addr "$request" $status $http_user_agent'
+dufs-duck --log-format '$remote_addr "$request" $status $http_user_agent'
 ```
 ```
 2022-08-06T06:53:55+08:00 INFO - 127.0.0.1 "GET /" 200 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36
@@ -345,7 +341,7 @@ dufs --log-format '$remote_addr "$request" $status $http_user_agent'
 
 Log remote-user
 ```
-dufs --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admin -a /folder1@user1:pass1
+dufs-duck --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admin -a /folder1@user1:pass1
 ```
 ```
 2022-08-06T07:04:37+08:00 INFO - 127.0.0.1 admin "GET /" 200
@@ -356,7 +352,7 @@ dufs --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admi
 Dufs can maintain a DuckDB index for file names and paths. The index is useful for large directories where real-time recursive search is expensive.
 
 ```sh
-dufs -A --enable-index
+dufs-duck -A --enable-index
 ```
 
 When indexing is enabled:
@@ -377,7 +373,7 @@ By default, the live database is stored at `<serve-path>/.dufs/index.duckdb`. Us
 Use `--index-remote` to expose a read-only DuckDB snapshot at `__dufs__/index.duckdb`.
 
 ```sh
-dufs -A --enable-index --index-remote
+dufs-duck -A --enable-index --index-remote
 ```
 
 Only users with full root access can download the remote index snapshot. Users with partial path access receive `403 Forbidden`, because the snapshot contains metadata for the whole indexed tree.
@@ -508,7 +504,7 @@ tls-key: tests/data/key_pkcs1.pem
 Dufs allows users to customize the UI with your own assets.
 
 ```
-dufs --assets my-assets-dir/
+dufs-duck --assets my-assets-dir/
 ```
 
 > If you only need to make slight adjustments to the current UI, you copy dufs's [assets](https://github.com/sigoden/dufs/tree/main/assets) directory and modify it accordingly. The current UI doesn't use any frameworks, just plain HTML/JS/CSS. As long as you have some basic knowledge of web development, it shouldn't be difficult to modify.
